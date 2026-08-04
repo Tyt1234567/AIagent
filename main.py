@@ -20,6 +20,8 @@ from geoai_agent.agent import GeoAIAgent
 EXAMPLE_QUERIES = [
     "Which bridge should we reinforce first, considering flood risk and the population that depends on it to reach the hospital?",
     "What is the area of zone_cluster_a?",
+    "Where would floodwater actually pool in this town, and how significant are those low points compared to noise?",
+    "Where are the population density peaks, and what's the natural boundary between the two residential clusters?",
 ]
 
 
