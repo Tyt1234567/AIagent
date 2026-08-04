@@ -11,6 +11,10 @@ Core orchestrator: implements the pipeline in geoai-workflow.png.
                                    -> [6] Spatial Reasoning (synthesis)
                                    -> [7] Recommendation
                                    -> Human (feedback) -> Agent Re-runs -> back to GeoAI Agent
+              morse_needed        -> [4] Morse Topology Analysis (critical points, persistence, basins
+                                       on a continuous scalar field -- see morse_topology.py)
+                                   -> [7] Recommendation
+                                   -> Human (feedback) -> Agent Re-runs -> back to GeoAI Agent
 """
 
 import json
@@ -19,6 +23,7 @@ from geoai_agent.data import GeoDataset
 from geoai_agent.geometry_tools import STANDARD_GIS_TOOLS
 from geoai_agent.integration import integrate_results
 from geoai_agent.llm_client import LLMClient
+from geoai_agent.topology_tools import analyze_scalar_topology
 from geoai_agent import prompts
 
 
@@ -94,6 +99,9 @@ class GeoAIAgent:
             self._run_standard_gis_tool(routing)
             return {"route": "geometry"}
 
+        if routing.get("morse_needed"):
+            return self._run_morse_analysis(routing, extra_context)
+
         representation = self._select_representation(task_spec)
         _log("3 Select Representation", representation)
 
@@ -140,6 +148,19 @@ class GeoAIAgent:
         except TypeError as exc:
             result = {"error": f"invalid arguments for '{tool_name}': {exc}", "params_received": params}
         _log("Standard GIS Tools", result)
+
+    def _run_morse_analysis(self, routing: dict, extra_context: str) -> dict:
+        field_name = routing.get("field", "elevation")
+        threshold = routing.get("persistence_threshold")
+        result = analyze_scalar_topology(self.dataset, field_name, persistence_threshold=threshold)
+        _log("4 Morse Topology Analysis", result)
+        recommendation = self._morse_recommendation(result, extra_context)
+        return {"route": "morse", "recommendation": recommendation}
+
+    def _morse_recommendation(self, morse_result: dict, extra_context: str) -> str:
+        user_prompt = f"Morse analysis result: {json.dumps(morse_result, ensure_ascii=False)}\n{extra_context}"
+        recommendation = self.llm.chat(prompts.MORSE_RECOMMENDATION_SYSTEM, user_prompt)
+        return recommendation
 
     def _select_representation(self, task_spec: dict) -> dict:
         user_prompt = f"Task spec: {json.dumps(task_spec, ensure_ascii=False)}"

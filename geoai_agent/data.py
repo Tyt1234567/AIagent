@@ -14,14 +14,23 @@ Layers:
   for adjacency analysis.
 - population_points: list of (shapely Point, population, nearest_node_id).
 - hospital_node: the node id representing the critical service (hospital).
+- scalar_fields: dict of named ScalarField grids (elevation, hazard_intensity,
+  population_density) for discrete-Morse / topological analysis -- see
+  geoai_agent/morse_topology.py. Not tied to any single one of these; the
+  same engine runs on whichever field a query calls for.
 """
 
 from dataclasses import dataclass
 
 import networkx as nx
+import numpy as np
 from shapely.geometry import LineString, Point, Polygon
 
+from geoai_agent.morse_topology import ScalarField
+
 HOSPITAL_NODE = "N1"
+DOMAIN_BOUNDS = (-8.0, -6.0, 25.0, 13.0)  # xmin, ymin, xmax, ymax, covers the town with margin
+GRID_RESOLUTION = 24
 
 
 @dataclass
@@ -111,6 +120,57 @@ def build_population_points() -> list[PopulationPoint]:
     ]
 
 
+def _grid() -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    xmin, ymin, xmax, ymax = DOMAIN_BOUNDS
+    xs = np.linspace(xmin, xmax, GRID_RESOLUTION)
+    ys = np.linspace(ymin, ymax, GRID_RESOLUTION)
+    xx, yy = np.meshgrid(xs, ys)
+    return xs, ys, xx, yy
+
+
+def build_elevation_field() -> ScalarField:
+    """Synthetic terrain: two low-lying depressions near the river crossings
+    (flood-prone, one under the hazard zone, one near Bridge B), a highland
+    plateau on the north bank around the hospital, and two minor hills
+    behind each south cluster. Purely illustrative, not physically modeled."""
+    xs, ys, xx, yy = _grid()
+    values = (
+        5.0
+        - 3.0 * np.exp(-((xx - 0) ** 2 + (yy - 5) ** 2) / 40)
+        - 2.0 * np.exp(-((xx - 20) ** 2 + (yy - 2) ** 2) / 40)
+        + 2.5 * np.exp(-((xx - 10) ** 2 + (yy - 10) ** 2) / 30)
+        + 1.5 * np.exp(-((xx + 3) ** 2 + (yy + 3) ** 2) / 15)
+        + 1.5 * np.exp(-((xx - 23) ** 2 + (yy + 3) ** 2) / 15)
+    )
+    return ScalarField(name="elevation", xs=xs, ys=ys, values=values)
+
+
+def build_hazard_intensity_field() -> ScalarField:
+    """Flood intensity: a strong hotspot centered on the hazard corridor
+    around Bridge A, plus a smaller secondary hotspot elsewhere so the
+    field has more than one topological feature to distinguish by
+    persistence (real hotspot vs. noise)."""
+    xs, ys, xx, yy = _grid()
+    values = (
+        4.0 * np.exp(-((xx - 0) ** 2 + (yy - 5) ** 2) / 30)
+        + 1.0 * np.exp(-((xx - 14) ** 2 + (yy - 2) ** 2) / 10)
+    )
+    return ScalarField(name="hazard_intensity", xs=xs, ys=ys, values=values)
+
+
+def build_population_density_field(population_points: list["PopulationPoint"]) -> ScalarField:
+    """Population density as a sum of Gaussian kernels centered on each
+    population point, weighted by population. Peaks mark density maxima;
+    saddles between clusters mark natural service-area boundaries."""
+    xs, ys, xx, yy = _grid()
+    sigma = 2.5
+    values = np.zeros_like(xx)
+    for pop in population_points:
+        px, py = pop.point.x, pop.point.y
+        values += pop.population * np.exp(-((xx - px) ** 2 + (yy - py) ** 2) / (2 * sigma ** 2))
+    return ScalarField(name="population_density", xs=xs, ys=ys, values=values)
+
+
 class GeoDataset:
     """Bundles all synthetic layers used by the pipeline for one run."""
 
@@ -120,3 +180,8 @@ class GeoDataset:
         self.zones = build_zones()
         self.population_points = build_population_points()
         self.hospital_node = HOSPITAL_NODE
+        self.scalar_fields: dict[str, ScalarField] = {
+            "elevation": build_elevation_field(),
+            "hazard_intensity": build_hazard_intensity_field(),
+            "population_density": build_population_density_field(self.population_points),
+        }
