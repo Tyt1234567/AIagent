@@ -202,7 +202,8 @@ let realworldMap;
 let realworldTileLayer;
 let realworldLayerControl;
 const realworldOverlays = {};
-let sqPreviewRect = null; // outline of the bounding box shown right after parsing, before analysis runs
+let sqPreviewRect = null; // outline of the bounding box shown right after parsing, before raw data loads
+let rwDatasetId = null; // server-cached raw dataset from the last load; reused by Analyze so data isn't fetched twice
 
 function initRealworldMap() {
   realworldMap = L.map("realworld-map");
@@ -249,19 +250,12 @@ document.getElementById("rw-add-layer").addEventListener("click", () => {
   document.getElementById("rw-custom-layers").appendChild(row);
 });
 
-async function submitRealworldAnalyze() {
-  const bounds = document.getElementById("rw-bounds").value.trim();
-  const resolution = document.getElementById("rw-resolution").value;
-  const variable = document.getElementById("rw-variable").value;
-  const useSample = document.getElementById("rw-sample").checked;
-  const recommend = document.getElementById("rw-recommend").checked;
-
+function buildRealworldFormData() {
   const formData = new FormData();
-  formData.append("bounds", bounds);
-  formData.append("resolution", resolution);
-  formData.append("primary_variable", variable);
-  formData.append("use_sample_layer", useSample ? "true" : "false");
-  formData.append("recommend", recommend ? "true" : "false");
+  formData.append("bounds", document.getElementById("rw-bounds").value.trim());
+  formData.append("resolution", document.getElementById("rw-resolution").value);
+  formData.append("primary_variable", document.getElementById("rw-variable").value);
+  formData.append("use_sample_layer", document.getElementById("rw-sample").checked ? "true" : "false");
 
   document.querySelectorAll(".custom-layer-row").forEach((row) => {
     const name = row.querySelector(".rw-layer-name").value.trim();
@@ -273,8 +267,66 @@ async function submitRealworldAnalyze() {
       if (description) formData.append(`layer_description::${name}`, description);
     }
   });
+  return formData;
+}
 
-  setStatus("rw-status", "Fetching real-world data and running Morse analysis...");
+// Fetches just the raw scalar field(s) -- no critical-point analysis, no
+// recommendation -- as soon as a location is confirmed, rather than only
+// as part of the final Analyze step. Renders the real heatmap on the map
+// immediately and caches the dataset server-side (rwDatasetId) so the
+// later Analyze call can reuse it instead of fetching all over again.
+async function loadRawDataPreview() {
+  const formData = buildRealworldFormData();
+  setStatus("rw-status", "Loading raw data for the confirmed location...");
+  try {
+    const res = await fetch("/api/realworld/load_data", { method: "POST", body: formData });
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.error || "request failed");
+    rwDatasetId = data.dataset_id;
+
+    realworldMap.fitBounds(data.bounds);
+    clearRealworldOverlays();
+    if (sqPreviewRect) {
+      realworldMap.removeLayer(sqPreviewRect);
+      sqPreviewRect = null;
+    }
+    let first = true;
+    for (const [name, layer] of Object.entries(data.layers)) {
+      const field = fieldLayer(layer.field);
+      realworldOverlays[name + " (raw field)"] = field;
+      if (first) { field.addTo(realworldMap); first = false; }
+    }
+    realworldLayerControl = L.control.layers(null, realworldOverlays, { collapsed: false }).addTo(realworldMap);
+    setStatus("rw-status", "Raw data loaded -- click \"Fetch & Analyze\" to find critical points.");
+  } catch (err) {
+    setStatus("rw-status", "Error loading raw data: " + err.message, true);
+  }
+}
+
+// Any manual edit invalidates the cached raw dataset -- it no longer
+// matches what's in the fields, so Analyze must fetch fresh instead of
+// reusing stale data. Only fires on genuine user edits: Smart Query sets
+// these fields' .value programmatically, which does not dispatch input
+// events, so the auto-load in renderSmartQueryClarify is unaffected.
+["rw-bounds", "rw-variable", "rw-resolution"].forEach((id) => {
+  document.getElementById(id).addEventListener("input", () => { rwDatasetId = null; });
+  document.getElementById(id).addEventListener("change", () => { rwDatasetId = null; });
+});
+document.getElementById("rw-add-layer").addEventListener("click", () => { rwDatasetId = null; });
+document.getElementById("rw-sample").addEventListener("change", () => { rwDatasetId = null; });
+
+async function submitRealworldAnalyze(feedback) {
+  const formData = buildRealworldFormData();
+  const recommend = document.getElementById("rw-recommend").checked;
+  formData.append("recommend", recommend ? "true" : "false");
+  if (feedback) formData.append("feedback", feedback);
+  if (rwDatasetId) formData.append("dataset_id", rwDatasetId);
+
+  setStatus("rw-status", feedback
+    ? "Re-running with your feedback..."
+    : rwDatasetId
+      ? "Running Morse analysis on the already-loaded data..."
+      : "Fetching real-world data and running Morse analysis...");
   document.getElementById("rw-result").hidden = true;
   try {
     const res = await fetch("/api/realworld/analyze", { method: "POST", body: formData });
@@ -286,6 +338,27 @@ async function submitRealworldAnalyze() {
     setStatus("rw-status", "Error: " + err.message, true);
   }
 }
+
+function updateGroundResolutionHint() {
+  const el = document.getElementById("rw-ground-resolution");
+  const parts = document.getElementById("rw-bounds").value.split(",").map(Number);
+  const resolution = Number(document.getElementById("rw-resolution").value);
+  if (parts.length !== 4 || parts.some(Number.isNaN) || !resolution || resolution < 2) {
+    el.textContent = "~ meters between sample points";
+    return;
+  }
+  const [latMin, latMax, lonMin, lonMax] = parts;
+  const midLatRad = ((latMin + latMax) / 2) * (Math.PI / 180);
+  const metersPerDegLat = 111320;
+  const metersPerDegLon = 111320 * Math.cos(midLatRad);
+  const latSpacing = (Math.abs(latMax - latMin) / (resolution - 1)) * metersPerDegLat;
+  const lonSpacing = (Math.abs(lonMax - lonMin) / (resolution - 1)) * metersPerDegLon;
+  const spacing = Math.max(latSpacing, lonSpacing);
+  el.textContent = `~${Math.round(spacing)}m between sample points` +
+    (spacing < 90 ? " (already finer than Open-Meteo's ~90m elevation data -- no benefit from going higher for elevation)" : "");
+}
+document.getElementById("rw-bounds").addEventListener("input", updateGroundResolutionHint);
+document.getElementById("rw-resolution").addEventListener("input", updateGroundResolutionHint);
 
 function renderRealworldResult(data) {
   realworldMap.fitBounds(data.bounds);
@@ -327,9 +400,23 @@ function renderRealworldResult(data) {
   document.getElementById("rw-result").hidden = false;
   document.getElementById("rw-recommendation").textContent =
     data.recommendation || "(not requested)";
+  document.getElementById("rw-feedback-box").style.display = data.recommendation ? "" : "none";
+  document.getElementById("rw-feedback").value = "";
 }
 
-document.getElementById("rw-submit").addEventListener("click", submitRealworldAnalyze);
+document.getElementById("rw-submit").addEventListener("click", () => submitRealworldAnalyze());
+document.getElementById("rw-rerun").addEventListener("click", () => {
+  const feedback = document.getElementById("rw-feedback").value.trim();
+  if (!feedback) {
+    setStatus("rw-status", "Type feedback first, or click Accept.", true);
+    return;
+  }
+  submitRealworldAnalyze(feedback);
+});
+document.getElementById("rw-accept").addEventListener("click", () => {
+  document.getElementById("rw-feedback-box").style.display = "none";
+  setStatus("rw-status", "Recommendation accepted.");
+});
 
 // -- Smart Query parsing (free-text -> fills in the fields above) -----------
 //
@@ -379,13 +466,16 @@ function renderSmartQueryClarify(data) {
   document.getElementById("rw-bounds").value =
     [latMin, latMax, lonMin, lonMax].map((v) => v.toFixed(5)).join(",");
   document.getElementById("rw-variable").value = data.variable;
+  updateGroundResolutionHint();
 
   document.getElementById("sq-clarify-summary").innerHTML =
     `<b>Bounding box:</b> ${latMin.toFixed(3)}, ${latMax.toFixed(3)}, ${lonMin.toFixed(3)}, ${lonMax.toFixed(3)}` +
     placeLine +
     `<br><b>Topic:</b> ${data.variable}` +
-    `<br>Filled in below -- review and click "Fetch &amp; Analyze" when ready.`;
+    `<br>Loading the raw data now -- once it's on the map, click "Fetch &amp; Analyze" to find critical points.`;
   document.getElementById("sq-clarify").hidden = false;
+
+  loadRawDataPreview(); // fetch the raw field as soon as the location is confirmed, not at the end of the pipeline
 }
 
 document.getElementById("sq-parse").addEventListener("click", submitSmartQueryParse);
@@ -394,3 +484,4 @@ document.getElementById("sq-parse").addEventListener("click", submitSmartQueryPa
 
 initTownMap();
 initRealworldMap();
+updateGroundResolutionHint();
