@@ -201,8 +201,7 @@ Respond with a single JSON object with this exact shape:
   "place_name": "<a place name suitable for a live geocoding search, or null>",
   "explicit_bounds": [lat_min, lat_max, lon_min, lon_max] or null,
   "variable": "elevation" | "temperature_2m" | "precipitation" | "wind_speed_10m" | "relative_humidity_2m" | "surface_pressure",
-  "target_resolution_meters": <number, or null>,
-  "wants_high_resolution_elevation": true | false
+  "target_resolution_meters": <number, or null>
 }
 
 Rules:
@@ -231,15 +230,6 @@ Rules:
   the number here. This is a physical ground distance, not a grid point
   count -- the app converts it to a grid size itself. If no such distance
   is mentioned, set this to null (do not guess a default).
-- "wants_high_resolution_elevation": true only if "variable" is
-  "elevation" AND the query explicitly asks for LiDAR-quality, survey-grade,
-  sub-10-meter, or otherwise clearly "high resolution" / "high precision"
-  terrain data (e.g. mentions "LiDAR", "1 meter", "1m DEM", "high
-  resolution terrain", "survey grade"). false for every other case,
-  including when "variable" isn't "elevation", when a coarser
-  target_resolution_meters is given (e.g. 100m), or when no resolution is
-  mentioned at all -- do not default this to true just because the topic
-  is elevation.
 Only return the JSON object, nothing else."""
 
 

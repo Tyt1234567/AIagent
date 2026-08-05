@@ -224,7 +224,7 @@ let realworldLayerControl;
 const realworldOverlays = {};
 let sqPreviewRect = null; // outline of the bounding box shown right after parsing, before raw data loads
 let rwDatasetId = null; // server-cached raw dataset from the last load; reused by Analyze so data isn't fetched twice
-let rwElevationSource = "open_meteo"; // set automatically by Parse's source-selection analysis; "usgs" for high-res US requests
+let rwElevationSource = "auto"; // "auto" tries USGS 3DEP first for elevation, falling back to Open-Meteo automatically
 
 function initRealworldMap() {
   realworldMap = L.map("realworld-map");
@@ -277,7 +277,7 @@ document.getElementById("rw-add-layer").addEventListener("click", () => {
 function buildRealworldFormData() {
   const formData = new FormData();
   formData.append("bounds", document.getElementById("rw-bounds").value.trim());
-  formData.append("resolution", document.getElementById("rw-resolution").value);
+  formData.append("resolution_meters", document.getElementById("rw-resolution-meters").value);
   formData.append("primary_variable", document.getElementById("rw-variable").value);
   formData.append("use_sample_layer", document.getElementById("rw-sample").checked ? "true" : "false");
   formData.append("elevation_source", rwElevationSource);
@@ -302,8 +302,9 @@ function buildRealworldFormData() {
 // later Analyze call can reuse it instead of fetching all over again.
 async function loadRawDataPreview() {
   const formData = buildRealworldFormData();
-  setStatus("rw-status", rwElevationSource === "usgs"
-    ? "Loading raw data from USGS 3DEP (one request per point -- this can take up to a minute or two)..."
+  const variable = document.getElementById("rw-variable").value;
+  setStatus("rw-status", (variable === "elevation" && rwElevationSource !== "open_meteo")
+    ? "Trying USGS 3DEP first (one request per point -- this can take up to a minute or two)..."
     : "Loading raw data for the confirmed location...");
   try {
     const res = await fetch("/api/realworld/load_data", { method: "POST", body: formData });
@@ -342,9 +343,9 @@ async function loadRawDataPreview() {
 // auto-load in renderSmartQueryClarify is unaffected.
 function invalidateRwDataset() {
   rwDatasetId = null;
-  rwElevationSource = "open_meteo";
+  rwElevationSource = "auto";
 }
-["rw-bounds", "rw-variable", "rw-resolution"].forEach((id) => {
+["rw-bounds", "rw-variable", "rw-resolution-meters"].forEach((id) => {
   document.getElementById(id).addEventListener("input", invalidateRwDataset);
   document.getElementById(id).addEventListener("change", invalidateRwDataset);
 });
@@ -375,26 +376,43 @@ async function submitRealworldAnalyze(feedback) {
   }
 }
 
+// Mirrors resolution_for_target_spacing / ground_spacing_meters in
+// geoai_agent/real_data.py -- shows the grid point count and actually
+// achievable spacing a requested meters-based pixel size resolves to,
+// including when it gets capped, before the request is even sent.
+const RW_MIN_GRID_RESOLUTION = 6;
+const RW_MAX_GRID_RESOLUTION = 80;
+const RW_MAX_USGS_GRID_RESOLUTION = 10;
+
 function updateGroundResolutionHint() {
   const el = document.getElementById("rw-ground-resolution");
   const parts = document.getElementById("rw-bounds").value.split(",").map(Number);
-  const resolution = Number(document.getElementById("rw-resolution").value);
-  if (parts.length !== 4 || parts.some(Number.isNaN) || !resolution || resolution < 2) {
-    el.textContent = "~ meters between sample points";
+  const meters = Number(document.getElementById("rw-resolution-meters").value);
+  if (parts.length !== 4 || parts.some(Number.isNaN) || !meters || meters <= 0) {
+    el.textContent = "~ grid points";
     return;
   }
   const [latMin, latMax, lonMin, lonMax] = parts;
   const midLatRad = ((latMin + latMax) / 2) * (Math.PI / 180);
   const metersPerDegLat = 111320;
   const metersPerDegLon = 111320 * Math.cos(midLatRad);
-  const latSpacing = (Math.abs(latMax - latMin) / (resolution - 1)) * metersPerDegLat;
-  const lonSpacing = (Math.abs(lonMax - lonMin) / (resolution - 1)) * metersPerDegLon;
-  const spacing = Math.max(latSpacing, lonSpacing);
-  el.textContent = `~${Math.round(spacing)}m between sample points` +
-    (spacing < 90 ? " (already finer than Open-Meteo's ~90m elevation data -- no benefit from going higher for elevation)" : "");
+  const spanM = Math.max(Math.abs(latMax - latMin) * metersPerDegLat, Math.abs(lonMax - lonMin) * metersPerDegLon);
+
+  let resolution = Math.ceil(spanM / meters) + 1;
+  const cappedByMax = resolution > RW_MAX_GRID_RESOLUTION;
+  resolution = Math.max(RW_MIN_GRID_RESOLUTION, Math.min(resolution, RW_MAX_GRID_RESOLUTION));
+  const achieved = spanM / (resolution - 1);
+
+  let note = "";
+  if (cappedByMax) note = ` (capped at ${RW_MAX_GRID_RESOLUTION}x${RW_MAX_GRID_RESOLUTION} for practicality)`;
+  else if (resolution > RW_MAX_USGS_GRID_RESOLUTION) {
+    note = ` -- if USGS is used for elevation, it caps lower (${RW_MAX_USGS_GRID_RESOLUTION}x${RW_MAX_USGS_GRID_RESOLUTION})`;
+  }
+  el.textContent = `~${resolution}x${resolution} grid (${resolution * resolution} points, ` +
+    `~${Math.round(achieved)}m between samples)${note}`;
 }
 document.getElementById("rw-bounds").addEventListener("input", updateGroundResolutionHint);
-document.getElementById("rw-resolution").addEventListener("input", updateGroundResolutionHint);
+document.getElementById("rw-resolution-meters").addEventListener("input", updateGroundResolutionHint);
 
 function renderRealworldResult(data) {
   realworldMap.fitBounds(data.bounds);
@@ -501,25 +519,19 @@ function renderSmartQueryClarify(data) {
   document.getElementById("rw-bounds").value =
     [latMin, latMax, lonMin, lonMax].map((v) => v.toFixed(5)).join(",");
   document.getElementById("rw-variable").value = data.variable;
-  rwElevationSource = data.elevation_source || "open_meteo";
+  rwElevationSource = data.elevation_source || "auto";
 
-  // data.resolution can be set either because the query named a target
-  // meters spacing, or because source selection (e.g. USGS) forces a cap
-  // with no meters target given -- these need different wording.
   let resolutionLine = "";
-  if (data.resolution) {
-    document.getElementById("rw-resolution").value = data.resolution;
+  if (data.requested_resolution_meters) {
+    const requested = data.requested_resolution_meters;
     const achieved = data.achieved_resolution_meters;
-    if (data.requested_resolution_meters) {
-      const requested = data.requested_resolution_meters;
-      const closeEnough = achieved <= requested * 1.1; // within ~10% counts as "hit the target"
-      resolutionLine = closeEnough
-        ? `<br><b>Grid resolution:</b> set to ${data.resolution} (~${Math.round(achieved)}m between samples, close to the requested ${requested}m).`
-        : `<br><b>Grid resolution:</b> capped at ${data.resolution} (the max supported) -- this bounding box is too large to ` +
-          `actually reach ${requested}m; the closest achievable is ~${Math.round(achieved)}m. Shrink the bounding box for finer resolution.`;
-    } else if (achieved) {
-      resolutionLine = `<br><b>Grid resolution:</b> set to ${data.resolution} (~${Math.round(achieved)}m between samples).`;
-    }
+    document.getElementById("rw-resolution-meters").value = requested;
+    const closeEnough = achieved <= requested * 1.1; // within ~10% counts as "hit the target"
+    resolutionLine = closeEnough
+      ? `<br><b>Resolution:</b> ~${Math.round(achieved)}m between samples, close to the requested ${requested}m.`
+      : `<br><b>Resolution:</b> this bounding box is too large to actually reach ${requested}m at a ` +
+        `practical grid size; the closest achievable is ~${Math.round(achieved)}m. Shrink the bounding ` +
+        "box for finer resolution.";
   }
 
   const sourceLine = data.source_note ? `<br><b>Data source:</b> ${data.source_note}` : "";
