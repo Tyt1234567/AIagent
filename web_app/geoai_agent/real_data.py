@@ -18,7 +18,8 @@ Two ways to get a layer's data onto the analysis grid:
   (temperature, precipitation, wind speed, humidity, surface pressure).
   This is deliberately not elevation-only: OPEN_METEO_VARIABLES is a small
   registry so the same fetch/analysis path works for whichever topic a
-  query is actually about (see infer_variable_from_text).
+  query is actually about (see prompts.REALWORLD_QUERY_EXTRACTION_SYSTEM
+  for how a query is mapped onto one of these).
 
 A "slope" layer (gradient magnitude of elevation) is derived for free from
 whatever elevation data is loaded, giving a second genuinely real layer
@@ -44,63 +45,17 @@ _FETCH_BATCH = 100  # conservative shared batch size, verified against the eleva
 # Every entry is a live, keyless Open-Meteo endpoint. "elevation" hits the
 # dedicated elevation API; everything else hits the forecast API's
 # `current=<variable>` field, which returns live current-conditions data
-# (not historical/cached) for each requested coordinate.
-OPEN_METEO_VARIABLES: dict[str, dict] = {
-    "elevation": {"keywords": ["elevation", "terrain", "dem", "lidar", "height", "altitude", "topograph"]},
-    "temperature_2m": {"keywords": ["temperature", "heat", "warm", "cold", "thermal"]},
-    "precipitation": {"keywords": ["precipitation", "rain", "rainfall", "flood", "storm", "wet"]},
-    "wind_speed_10m": {"keywords": ["wind"]},
-    "relative_humidity_2m": {"keywords": ["humidity", "moisture"]},
-    "surface_pressure": {"keywords": ["pressure", "barometric"]},
-}
-
-
-def infer_variable_from_text(text: str, default: str = "elevation") -> str:
-    """Keyword-based topic classification: which OPEN_METEO_VARIABLES entry
-    a free-text query is asking about. Deliberately not elevation-only --
-    this is what lets the real-world pipeline handle "any topic" rather
-    than assuming terrain every time. Falls back to `default` if nothing
-    matches."""
-    lower = text.lower()
-    for variable, info in OPEN_METEO_VARIABLES.items():
-        if any(kw in lower for kw in info["keywords"]):
-            return variable
-    return default
-
-
-_COORD_RE = re.compile(
-    # No leading "-?" on the number: sign comes entirely from the N/S/E/W
-    # suffix below. A leading minus would misparse "40.96N-41.15N" (a
-    # hyphen-separated range with no spaces) as if the second number were
-    # negative, since the range-separating hyphen sits directly against it.
-    r"(\d+(?:\.\d+)?)\s*"
-    r"(?:\^\s*\\?circ)?\s*"           # optional ^\circ / ^circ (LaTeX degree)
-    r"(?:[°˚]|\bdegrees?\b)?\s*"  # optional degree symbol/word
-    r"(?:\\?text\s*\{)?\s*"           # optional \text{ wrapper
-    r"([NSEWnsew])\}?"
-)
-
-
-def parse_bounds_from_text(text: str) -> tuple[float, float, float, float] | None:
-    """Extracts an explicit lat/lon bounding box from free text, e.g.
-    "40.96 N - 41.15 N, 75.15 W - 74.95 W" (also tolerates LaTeX-ish
-    markup like degree symbols / \\text{} around the number). Needs at
-    least two latitude (N/S) and two longitude (E/W) matches; returns None
-    if it can't find an unambiguous box (the caller should then fall back
-    to geocoding a place name instead of guessing at coordinates)."""
-    lats, lons = [], []
-    for value, direction in _COORD_RE.findall(text):
-        v = float(value)
-        d = direction.upper()
-        if d == "S":
-            v = -v
-        elif d == "W":
-            v = -v
-        (lats if d in "NS" else lons).append(v)
-
-    if len(lats) < 2 or len(lons) < 2:
-        return None
-    return (min(lats), max(lats), min(lons), max(lons))
+# (not historical/cached) for each requested coordinate. Which one a given
+# free-text query is about, and what place/coordinates it names, is
+# figured out by an LLM extraction call (see
+# prompts.REALWORLD_QUERY_EXTRACTION_SYSTEM) rather than regex/keyword
+# matching here -- natural-language phrasing varies too much (prepositions,
+# capitalization, trailing qualifier clauses) for a hand-written pattern to
+# keep up with reliably.
+OPEN_METEO_VARIABLES = [
+    "elevation", "temperature_2m", "precipitation",
+    "wind_speed_10m", "relative_humidity_2m", "surface_pressure",
+]
 
 
 # -- geocoding: turn a place name into a bounding box ---------------------
@@ -157,72 +112,6 @@ def geocode_place(place_name: str) -> dict | None:
                 "name": r["name"], "admin1": r.get("admin1"), "country": r.get("country"),
                 "latitude": r["latitude"], "longitude": r["longitude"],
             }
-    return None
-
-
-_PLACE_PREPOSITION_RE = re.compile(r"\b(?:in|near|around|at|from|for)\s+(.+)$", re.IGNORECASE)
-_PLACE_QUALIFIER_RE = re.compile(
-    r"\s+(?:without|with|using|sampled|resolution|grid|to extract|to find|to identify|"
-    r"so that|while|and then|and)\b",
-    re.IGNORECASE,
-)
-
-
-def extract_place_candidates(text: str) -> list[str]:
-    """Best-effort place-name candidates to try geocoding, most to least
-    specific. Takes the text after the LAST locative preposition
-    (in/near/around/at/from/for), so an earlier non-locative "in" ("peaks
-    in the data") doesn't win over an actual place mention later in the
-    sentence. Deliberately does NOT assume proper capitalization (real
-    queries are often typed lowercase) -- instead strips a known trailing
-    qualifier phrase and caps at two comma-separated segments as a fast
-    path, then falls back to progressively dropping trailing words so
-    unusual qualifier phrasing that slips past the keyword list still
-    resolves eventually. The caller should try each candidate against
-    geocode_place() in order and stop at the first hit."""
-    stripped = text.strip().rstrip(".!?")
-    matches = list(_PLACE_PREPOSITION_RE.finditer(stripped))
-    if not matches:
-        return []
-    tail = matches[-1].group(1).strip()
-
-    cleaned = _PLACE_QUALIFIER_RE.split(tail, maxsplit=1)[0].strip().rstrip(",").strip()
-    parts = [p.strip() for p in cleaned.split(",") if p.strip()]
-    if len(parts) > 2:
-        cleaned = ", ".join(parts[:2])
-
-    candidates = [cleaned] if cleaned else []
-    if len(parts) >= 2:
-        # "Denver, CO at a" (trailing junk survives after the state, e.g.
-        # from a qualifier phrase the keyword split missed) still has a
-        # clean "Denver, <state>" prefix -- try just the first word of the
-        # region segment before falling back to word-by-word trimming,
-        # which would otherwise strip the comma entirely and lose the
-        # state-abbreviation-expansion path in geocode_place().
-        region_first_word = parts[1].split()[0] if parts[1].split() else ""
-        if region_first_word:
-            candidates.append(f"{parts[0]}, {region_first_word}")
-    if parts:
-        candidates.append(parts[0])
-    words = cleaned.replace(",", " ").split()
-    for cut in range(len(words) - 1, 1, -1):
-        candidates.append(" ".join(words[:cut]))
-
-    seen, out = set(), []
-    for c in candidates:
-        if c and c.lower() not in seen:
-            seen.add(c.lower())
-            out.append(c)
-    return out
-
-
-def geocode_from_text(text: str) -> dict | None:
-    """Extracts place-name candidates from free text and geocodes the
-    first one that resolves. Returns None if no candidate resolves."""
-    for candidate in extract_place_candidates(text):
-        result = geocode_place(candidate)
-        if result is not None:
-            return result
     return None
 
 
