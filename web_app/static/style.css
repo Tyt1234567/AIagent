@@ -187,13 +187,24 @@ button.secondary {
 
 .custom-layer-row {
   display: flex;
+  flex-wrap: wrap;
   gap: 6px;
   align-items: center;
   margin-top: 6px;
+  padding-bottom: 8px;
+  border-bottom: 1px dashed var(--border);
 }
 
 .custom-layer-row input[type="text"] {
-  flex: 1;
+  flex: 1 1 100%;
+}
+
+.custom-layer-row input.rw-layer-name {
+  flex: 1 1 40%;
+}
+
+.custom-layer-row input.rw-layer-file {
+  flex: 1 1 40%;
 }
 
 .layer-summary {

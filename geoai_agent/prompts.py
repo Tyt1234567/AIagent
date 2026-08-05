@@ -144,7 +144,12 @@ the field -- always double check whether a coordinate came from the
   between them, not population centers. Saddles between two significant
   maxima mark the natural boundary between their service/catchment areas.
 - any other field: apply the same minimum=low/maximum=high/saddle=pass
-  logic literally to whatever quantity the field measures.
+  logic literally to whatever quantity the field measures. If a
+  user-supplied description of a custom layer is included in the prompt
+  (e.g. "soil moisture sensor readings"), use it to interpret what a
+  significant minimum/maximum/saddle in that layer actually means, the
+  same way "hazard_intensity" or "population_density" are interpreted
+  above -- do not just describe it generically as "the field's value".
 
 If the prompt mentions that this data was fetched live from a public API
 (rather than pre-downloaded or user-supplied), or notes a specific method

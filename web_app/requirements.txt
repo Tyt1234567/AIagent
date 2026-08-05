@@ -3,3 +3,4 @@ openai
 shapely
 networkx
 numpy
+pyshp

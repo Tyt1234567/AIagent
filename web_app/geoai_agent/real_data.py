@@ -5,8 +5,13 @@ synthetic town in data.py. Feeds the same generic Morse engine
 (geoai_agent/morse_topology.py) the synthetic fields do.
 
 Two ways to get a layer's data onto the analysis grid:
-- User-supplied CSV of scattered (x, y, value) samples, interpolated onto
-  the grid with inverse-distance weighting (pure numpy, no scipy).
+- User-supplied scattered (x, y, value) samples -- a CSV with an x,y,value
+  header, or an ESRI shapefile (POINT geometry + a "value" attribute
+  field, as a .zip bundling .shp/.shx/.dbf) -- interpolated onto the grid
+  with inverse-distance weighting (pure numpy, no scipy; shapefile
+  parsing uses pyshp, a small pure-Python library with no further
+  dependencies). A layer can also carry a free-text description of what
+  it measures, passed through to the LLM recommendation step.
 - Online fetch, live at request time (nothing is ever pre-downloaded or
   cached to disk): any of several free, keyless Open-Meteo endpoints --
   terrain elevation, or a live current-conditions weather variable
@@ -156,9 +161,7 @@ def geocode_place(place_name: str) -> dict | None:
 
 
 _PLACE_PREPOSITION_RE = re.compile(r"\b(?:in|near|around|at)\s+(.+)$", re.IGNORECASE)
-_PLACE_TRAILING_CLAUSE_RE = re.compile(
-    r"\s+(?:without|to extract|to find|to identify|so that|while|and then|and)\b", re.IGNORECASE
-)
+_PLACE_TOKEN_RE = re.compile(r"[A-Za-z0-9.'-]+|,")
 
 
 def extract_place_candidate(text: str) -> str | None:
@@ -166,15 +169,29 @@ def extract_place_candidate(text: str) -> str | None:
     critical points in College Park, MD" -> "College Park, MD". Takes the
     text after the LAST locative preposition (in/near/around/at), so an
     earlier non-locative "in" ("peaks in the data") doesn't win over an
-    actual place mention later in the sentence. Best-effort only -- the
-    caller should treat a failed geocode of the result as "couldn't find a
-    location" rather than retrying indefinitely."""
+    actual place mention later in the sentence, then keeps a prefix of
+    tokens that looks like a proper-noun place name (Capitalized words,
+    ALL-CAPS abbreviations, numbers, commas), stopping at the first
+    ordinary lowercase word. This is what lets it strip an arbitrary
+    trailing qualifier clause ("...College Park, MD, with a resolution of
+    30 meters" -> "College Park, MD") without having to enumerate every
+    possible qualifier phrasing. Best-effort only -- the caller should
+    treat a failed geocode of the result as "couldn't find a location"
+    rather than retrying indefinitely."""
     stripped = text.strip().rstrip(".!?")
     matches = list(_PLACE_PREPOSITION_RE.finditer(stripped))
     if not matches:
         return None
-    candidate = matches[-1].group(1).strip()
-    candidate = _PLACE_TRAILING_CLAUSE_RE.split(candidate, maxsplit=1)[0].strip()
+    tail = matches[-1].group(1).strip()
+
+    kept = []
+    for tok in _PLACE_TOKEN_RE.findall(tail):
+        if tok == "," or tok[0].isupper() or tok.isupper() or tok[0].isdigit():
+            kept.append(tok)
+        else:
+            break
+
+    candidate = " ".join(kept).replace(" ,", ",").strip(", ")
     return candidate or None
 
 
@@ -193,12 +210,19 @@ class RealWorldDataset:
     ScalarField layers. Distinct from the synthetic GeoDataset: it carries
     no road network/zones, only scalar fields for the morse_needed branch."""
 
-    def __init__(self, name: str, bounds: tuple[float, float, float, float], scalar_fields: dict[str, ScalarField]):
+    def __init__(
+        self, name: str, bounds: tuple[float, float, float, float], scalar_fields: dict[str, ScalarField],
+        layer_descriptions: dict[str, str] | None = None,
+    ):
         # bounds = (lat_min, lat_max, lon_min, lon_max)
         self.name = name
         self.bounds = bounds
         self.is_geographic = True
         self.scalar_fields = scalar_fields
+        # free-text, user-supplied explanation of what a custom (non-Open-Meteo)
+        # layer actually measures -- passed to the LLM recommendation so it
+        # can interpret a field it has no built-in knowledge of.
+        self.layer_descriptions = layer_descriptions or {}
 
 
 def _grid(bounds: tuple[float, float, float, float], resolution: int) -> tuple[np.ndarray, np.ndarray]:
@@ -246,16 +270,64 @@ def load_csv_points(path: str) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     return np.array(xs), np.array(ys), np.array(vs)
 
 
-def scalar_field_from_csv(
+def load_shapefile_points(path: str, value_field: str = "value") -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Reads point samples from an ESRI shapefile (a .zip bundling
+    .shp/.shx/.dbf, or a bare .shp alongside its sidecar files) via pyshp.
+    Requires a POINT shape type and an attribute field named `value`
+    (case-insensitive) holding the scalar sample value."""
+    import shapefile
+
+    reader = shapefile.Reader(path)
+    if reader.shapeType not in (shapefile.POINT, shapefile.POINTZ, shapefile.POINTM):
+        raise ValueError(
+            f"shapefile '{path}' has shape type {reader.shapeType!r}, expected POINT "
+            "(scattered value samples, same role as the CSV x,y,value format)"
+        )
+    field_names = [f[0] for f in reader.fields[1:]]  # skip the DeletionFlag pseudo-field
+    matches = [f for f in field_names if f.lower() == value_field.lower()]
+    if not matches:
+        raise ValueError(
+            f"shapefile '{path}' has no attribute field named '{value_field}' "
+            f"(found: {field_names}); add one holding the scalar sample value"
+        )
+    field = matches[0]
+
+    xs, ys, vs = [], [], []
+    for shape_record in reader.shapeRecords():
+        x, y = shape_record.shape.points[0]
+        xs.append(x)
+        ys.append(y)
+        vs.append(float(shape_record.record[field]))
+    if not xs:
+        raise ValueError(f"no point features found in shapefile '{path}'")
+    return np.array(xs), np.array(ys), np.array(vs)
+
+
+def load_layer_points(path: str) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Dispatches to the CSV or shapefile loader based on file extension
+    (.zip/.shp -> shapefile, everything else -> CSV)."""
+    lower = path.lower()
+    if lower.endswith(".zip") or lower.endswith(".shp"):
+        return load_shapefile_points(path)
+    return load_csv_points(path)
+
+
+def scalar_field_from_upload(
     name: str, path: str, bounds: tuple[float, float, float, float],
     resolution: int = GRID_RESOLUTION, power: float = 2.0,
 ) -> ScalarField:
     """Builds a ScalarField for `name` by IDW-interpolating user-supplied
-    scattered samples in `path` onto the analysis grid over `bounds`."""
-    px, py, pv = load_csv_points(path)
+    scattered samples (CSV or shapefile, see load_layer_points) onto the
+    analysis grid over `bounds`."""
+    px, py, pv = load_layer_points(path)
     xs, ys = _grid(bounds, resolution)
     values = idw_interpolate(px, py, pv, xs, ys, power=power)
     return ScalarField(name=name, xs=xs, ys=ys, values=values)
+
+
+# kept for existing callers -- CSV was the only supported upload format
+# before shapefile support was added.
+scalar_field_from_csv = scalar_field_from_upload
 
 
 def fetch_open_meteo_field(
@@ -317,28 +389,37 @@ def build_real_world_dataset(
     layer_sources: dict[str, str | None] | None = None,
     resolution: int = GRID_RESOLUTION,
     include_slope: bool = True,
+    layer_descriptions: dict[str, str] | None = None,
 ) -> RealWorldDataset:
     """Builds a RealWorldDataset with one or more named layers.
 
-    layer_sources maps layer name -> CSV path, or -> None to mean "fetch
-    online" (only supported for the "elevation" layer, via Open-Meteo). If
-    omitted entirely, defaults to fetching elevation online.
+    layer_sources maps layer name -> a CSV or shapefile (.zip/.shp) path,
+    or -> None to mean "fetch online" (only supported for
+    OPEN_METEO_VARIABLES entries). If omitted entirely, defaults to
+    fetching elevation online.
+
+    layer_descriptions optionally maps layer name -> a free-text
+    explanation of what it measures, carried through on the returned
+    dataset for the caller to pass to an LLM recommendation step (custom
+    uploaded layers have no built-in meaning the way "elevation" does).
     """
     layer_sources = layer_sources or {"elevation": None}
     fields: dict[str, ScalarField] = {}
 
     for layer_name, source in layer_sources.items():
         if source is not None:
-            fields[layer_name] = scalar_field_from_csv(layer_name, source, bounds, resolution)
+            fields[layer_name] = scalar_field_from_upload(layer_name, source, bounds, resolution)
         elif layer_name in OPEN_METEO_VARIABLES:
             fields[layer_name] = fetch_open_meteo_field(layer_name, bounds, resolution)
         else:
             raise ValueError(
-                f"layer '{layer_name}' has no CSV source and is not a live-fetchable "
+                f"layer '{layer_name}' has no uploaded source and is not a live-fetchable "
                 f"variable (available: {list(OPEN_METEO_VARIABLES)})"
             )
 
     if include_slope and "elevation" in fields and "slope" not in fields:
         fields["slope"] = derive_slope_field(fields["elevation"])
 
-    return RealWorldDataset(name=name, bounds=bounds, scalar_fields=fields)
+    return RealWorldDataset(
+        name=name, bounds=bounds, scalar_fields=fields, layer_descriptions=layer_descriptions,
+    )

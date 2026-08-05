@@ -3,3 +3,4 @@ shapely
 networkx
 numpy
 flask
+pyshp
