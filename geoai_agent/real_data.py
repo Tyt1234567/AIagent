@@ -82,7 +82,7 @@ def parse_bounds_from_text(text: str) -> tuple[float, float, float, float] | Non
     markup like degree symbols / \\text{} around the number). Needs at
     least two latitude (N/S) and two longitude (E/W) matches; returns None
     if it can't find an unambiguous box (the caller should then fall back
-    to another route rather than guess at coordinates)."""
+    to geocoding a place name instead of guessing at coordinates)."""
     lats, lons = [], []
     for value, direction in _COORD_RE.findall(text):
         v = float(value)
@@ -96,6 +96,96 @@ def parse_bounds_from_text(text: str) -> tuple[float, float, float, float] | Non
     if len(lats) < 2 or len(lons) < 2:
         return None
     return (min(lats), max(lats), min(lons), max(lons))
+
+
+# -- geocoding: turn a place name into a bounding box ---------------------
+#
+# So a query naming a real place ("College Park, MD") works without the
+# user having to look up and type coordinates themselves. Live, keyless,
+# same Open-Meteo family as the scalar-field fetches above -- nothing is
+# pre-downloaded or cached.
+
+_US_STATE_ABBREVIATIONS = {
+    "AL": "Alabama", "AK": "Alaska", "AZ": "Arizona", "AR": "Arkansas", "CA": "California",
+    "CO": "Colorado", "CT": "Connecticut", "DE": "Delaware", "FL": "Florida", "GA": "Georgia",
+    "HI": "Hawaii", "ID": "Idaho", "IL": "Illinois", "IN": "Indiana", "IA": "Iowa",
+    "KS": "Kansas", "KY": "Kentucky", "LA": "Louisiana", "ME": "Maine", "MD": "Maryland",
+    "MA": "Massachusetts", "MI": "Michigan", "MN": "Minnesota", "MS": "Mississippi",
+    "MO": "Missouri", "MT": "Montana", "NE": "Nebraska", "NV": "Nevada", "NH": "New Hampshire",
+    "NJ": "New Jersey", "NM": "New Mexico", "NY": "New York", "NC": "North Carolina",
+    "ND": "North Dakota", "OH": "Ohio", "OK": "Oklahoma", "OR": "Oregon", "PA": "Pennsylvania",
+    "RI": "Rhode Island", "SC": "South Carolina", "SD": "South Dakota", "TN": "Tennessee",
+    "TX": "Texas", "UT": "Utah", "VT": "Vermont", "VA": "Virginia", "WA": "Washington",
+    "WV": "West Virginia", "WI": "Wisconsin", "WY": "Wyoming", "DC": "District of Columbia",
+}
+_TRAILING_STATE_RE = re.compile(r",\s*([A-Za-z]{2})\s*$")
+
+
+def _expand_trailing_state_abbreviation(place_name: str) -> str:
+    """Open-Meteo's geocoding search matches full state names, not
+    2-letter abbreviations -- "College Park, MD" returns nothing, but
+    "College Park, Maryland" does. Expands a trailing ", XX" if XX is a
+    known US state/DC abbreviation; leaves anything else untouched."""
+    m = _TRAILING_STATE_RE.search(place_name)
+    if not m:
+        return place_name
+    full = _US_STATE_ABBREVIATIONS.get(m.group(1).upper())
+    if not full:
+        return place_name
+    return place_name[: m.start()] + ", " + full
+
+
+def geocode_place(place_name: str) -> dict | None:
+    """Live lookup of a place name via Open-Meteo's free geocoding API.
+    Returns the best-matching {"name", "admin1", "country", "latitude",
+    "longitude"} or None if nothing matched."""
+    for candidate in (place_name, _expand_trailing_state_abbreviation(place_name)):
+        query = urllib.parse.urlencode({"name": candidate, "count": 1, "format": "json"})
+        with urllib.request.urlopen(
+            f"https://geocoding-api.open-meteo.com/v1/search?{query}", timeout=15
+        ) as resp:
+            payload = json.loads(resp.read())
+        results = payload.get("results") or []
+        if results:
+            r = results[0]
+            return {
+                "name": r["name"], "admin1": r.get("admin1"), "country": r.get("country"),
+                "latitude": r["latitude"], "longitude": r["longitude"],
+            }
+    return None
+
+
+_PLACE_PREPOSITION_RE = re.compile(r"\b(?:in|near|around|at)\s+(.+)$", re.IGNORECASE)
+_PLACE_TRAILING_CLAUSE_RE = re.compile(
+    r"\s+(?:without|to extract|to find|to identify|so that|while|and then|and)\b", re.IGNORECASE
+)
+
+
+def extract_place_candidate(text: str) -> str | None:
+    """Heuristic extraction of a place name from free text, e.g. "find
+    critical points in College Park, MD" -> "College Park, MD". Takes the
+    text after the LAST locative preposition (in/near/around/at), so an
+    earlier non-locative "in" ("peaks in the data") doesn't win over an
+    actual place mention later in the sentence. Best-effort only -- the
+    caller should treat a failed geocode of the result as "couldn't find a
+    location" rather than retrying indefinitely."""
+    stripped = text.strip().rstrip(".!?")
+    matches = list(_PLACE_PREPOSITION_RE.finditer(stripped))
+    if not matches:
+        return None
+    candidate = matches[-1].group(1).strip()
+    candidate = _PLACE_TRAILING_CLAUSE_RE.split(candidate, maxsplit=1)[0].strip()
+    return candidate or None
+
+
+def bounding_box_around_point(
+    latitude: float, longitude: float, half_width_deg: float = 0.06
+) -> tuple[float, float, float, float]:
+    """A small lat/lon bounding box centered on a geocoded point (roughly
+    town/neighborhood scale at typical mid-latitudes -- default
+    half_width_deg=0.06 is about 13km tall)."""
+    return (latitude - half_width_deg, latitude + half_width_deg,
+            longitude - half_width_deg, longitude + half_width_deg)
 
 
 class RealWorldDataset:

@@ -338,8 +338,15 @@ async function submitSmartQueryParse() {
 
 function renderSmartQueryClarify(data) {
   const [latMin, latMax, lonMin, lonMax] = data.bounds;
+  const place = data.resolved_place;
+  const placeLine = place
+    ? `<br><b>Resolved place:</b> ${place.name}, ${place.admin1 || ""} ${place.country || ""} ` +
+      `(${place.latitude.toFixed(4)}, ${place.longitude.toFixed(4)}) -- a small box was drawn around ` +
+      `this point; edit the manual Bounds field below and re-parse if it's the wrong "${place.name}".`
+    : "";
   document.getElementById("sq-clarify-summary").innerHTML =
     `<b>Bounding box:</b> ${latMin.toFixed(3)}, ${latMax.toFixed(3)}, ${lonMin.toFixed(3)}, ${lonMax.toFixed(3)}` +
+    placeLine +
     `<br><b>Inferred topic:</b> ${data.variable} -- change it below if that's wrong.`;
 
   const select = document.getElementById("sq-variable");
