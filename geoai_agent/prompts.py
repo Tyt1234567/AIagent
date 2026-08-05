@@ -163,6 +163,41 @@ value vs. the threshold used), and end with a one-sentence actionable
 takeaway for the reviewer."""
 
 
+REALWORLD_QUERY_EXTRACTION_SYSTEM = """You are the query-understanding stage of a real-world
+geographic data analysis tool (web_app's "Smart Query" feature). Given a
+free-text user query, work out what real-world location and data topic it
+is asking about, so the app can fetch live data for it.
+
+Respond with a single JSON object with this exact shape:
+{
+  "place_name": "<a place name suitable for a live geocoding search, or null>",
+  "explicit_bounds": [lat_min, lat_max, lon_min, lon_max] or null,
+  "variable": "elevation" | "temperature_2m" | "precipitation" | "wind_speed_10m" | "relative_humidity_2m" | "surface_pressure"
+}
+
+Rules:
+- If the query already gives explicit numeric coordinates or a bounding
+  box (in any format -- decimal degrees, N/S/E/W, LaTeX-ish markup), put
+  them in "explicit_bounds" as [lat_min, lat_max, lon_min, lon_max] and
+  set "place_name" to null.
+- Otherwise, if the query names a real place (city, neighborhood,
+  landmark, park, region, etc.), put JUST the place name into
+  "place_name" -- strip surrounding words that aren't part of the name
+  itself ("from", "in", "the DEM", "with a resolution of 30 meters", "at
+  a fine grid", etc.). Expand a US state abbreviation to its full name if
+  you're confident (e.g. "College Park, MD" -> "College Park, Maryland").
+  Do not invent a place that isn't actually named in the query -- if none
+  is named and there are no explicit coordinates either, set both
+  "place_name" and "explicit_bounds" to null.
+- "variable": whichever of the six listed options the query is actually
+  about (terrain/DEM/LiDAR/elevation/topography -> "elevation";
+  heat/warm/cold -> "temperature_2m"; rain/flood/storm -> "precipitation";
+  wind -> "wind_speed_10m"; moisture -> "relative_humidity_2m";
+  barometric -> "surface_pressure"). Default to "elevation" if the query
+  doesn't clearly name a different topic.
+Only return the JSON object, nothing else."""
+
+
 RERUN_CONTEXT_TEMPLATE = """The human reviewer rejected the previous recommendation and gave this feedback:
 "{feedback}"
 

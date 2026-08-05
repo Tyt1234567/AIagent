@@ -41,9 +41,7 @@ from geoai_agent.real_data import (
     OPEN_METEO_VARIABLES,
     bounding_box_around_point,
     build_real_world_dataset,
-    geocode_from_text,
-    infer_variable_from_text,
-    parse_bounds_from_text,
+    geocode_place,
 )
 from geoai_agent.visualize import critical_points_to_geojson, field_to_geojson
 
@@ -254,11 +252,16 @@ def realworld_analyze():
 #
 # Two round trips, so the app can surface a decision to the user instead of
 # guessing (mirrors the CLI/agent's human-in-the-loop pattern):
-#   stage="parse" -- extract a lat/lon bounding box and infer which live
-#     variable (elevation, temperature, precipitation, wind, humidity,
-#     pressure -- see geoai_agent.real_data.OPEN_METEO_VARIABLES) the query
-#     is about; nothing is fetched yet. Returns needs_input with what was
-#     inferred so the user can confirm or correct it before anything runs.
+#   stage="parse" -- an LLM extraction call (prompts.
+#     REALWORLD_QUERY_EXTRACTION_SYSTEM) works out what place/coordinates
+#     and which live variable (elevation, temperature, precipitation, wind,
+#     humidity, pressure -- see geoai_agent.real_data.OPEN_METEO_VARIABLES)
+#     the query is about -- natural-language phrasing (prepositions,
+#     capitalization, trailing qualifier clauses like "with a resolution of
+#     30 meters") varies too much for a hand-written pattern to keep up
+#     with reliably. A named place is then live-geocoded to coordinates.
+#     Nothing is fetched yet; returns needs_input with what was understood
+#     so the user can confirm or correct it before anything runs.
 #   stage="run" -- the user-confirmed bounds/variable (and, for elevation,
 #     a choice between the free public DEM and their own uploaded CSV) are
 #     fetched live right now and analyzed. No data is ever pre-downloaded
@@ -272,18 +275,27 @@ def realworld_smart_query():
         return jsonify({"error": "query is required"}), 400
 
     if stage == "parse":
-        bounds = parse_bounds_from_text(query)
-        resolved_place = None
+        try:
+            extraction = LLMClient().chat_json(prompts.REALWORLD_QUERY_EXTRACTION_SYSTEM, query)
+        except Exception as exc:
+            return jsonify({"error": f"query understanding failed: {exc}"}), 502
 
-        if bounds is None:
-            # No explicit lat/lon in the text -- try resolving a named
-            # place (e.g. "College Park, MD") via live geocoding instead
-            # of making the user look up and type coordinates themselves.
-            geocoded = geocode_from_text(query)
+        variable = extraction.get("variable")
+        if variable not in OPEN_METEO_VARIABLES:
+            variable = "elevation"
+
+        explicit_bounds = extraction.get("explicit_bounds")
+        resolved_place = None
+        if explicit_bounds and len(explicit_bounds) == 4:
+            bounds = tuple(float(x) for x in explicit_bounds)
+        else:
+            place_name = extraction.get("place_name")
+            geocoded = geocode_place(place_name) if place_name else None
             if geocoded is None:
                 return jsonify({
                     "error": (
-                        "Couldn't find a real-world location in that text. "
+                        f"Couldn't find a real-world location in that text"
+                        f"{f' (understood it as \"{place_name}\")' if place_name else ''}. "
                         "Try naming a place more explicitly (e.g. \"...in Boulder, Colorado\"), "
                         "an explicit lat/lon box like '40.96N-41.15N, 75.15W-74.95W', "
                         "or use the manual Bounds field above instead."
@@ -292,7 +304,6 @@ def realworld_smart_query():
             bounds = bounding_box_around_point(geocoded["latitude"], geocoded["longitude"])
             resolved_place = geocoded
 
-        variable = infer_variable_from_text(query)
         lat_min, lat_max, lon_min, lon_max = bounds
         return jsonify({
             "needs_input": True,
