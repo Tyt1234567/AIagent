@@ -31,6 +31,7 @@ from __future__ import annotations
 
 import csv
 import json
+import math
 import re
 import urllib.error
 import urllib.request
@@ -41,7 +42,15 @@ import numpy as np
 from geoai_agent.morse_topology import ScalarField
 
 GRID_RESOLUTION = 20
+MIN_GRID_RESOLUTION = 6
+# The Morse engine itself handles a 100x100 grid in well under a second;
+# the real cost is live HTTP fetch batches (100 coordinates/request), which
+# scale with resolution^2. 80 keeps a worst-case request in the
+# tens-of-seconds range rather than minutes, and well clear of Open-Meteo's
+# per-minute rate limit.
+MAX_GRID_RESOLUTION = 80
 _FETCH_BATCH = 100  # conservative shared batch size, verified against the elevation endpoint's limit
+_METERS_PER_DEGREE_LAT = 111_320
 
 # Every entry is a live, keyless Open-Meteo endpoint. "elevation" hits the
 # dedicated elevation API; everything else hits the forecast API's
@@ -124,6 +133,39 @@ def bounding_box_around_point(
     half_width_deg=0.06 is about 13km tall)."""
     return (latitude - half_width_deg, latitude + half_width_deg,
             longitude - half_width_deg, longitude + half_width_deg)
+
+
+def ground_spacing_meters(bounds: tuple[float, float, float, float], resolution: int) -> float:
+    """The actual meters-between-sample-points a grid resolution achieves
+    over a bounding box (the larger of the lat/lon spacings, since that's
+    the coarser -- worse-case -- direction)."""
+    lat_min, lat_max, lon_min, lon_max = bounds
+    mid_lat_rad = math.radians((lat_min + lat_max) / 2)
+    meters_per_deg_lon = _METERS_PER_DEGREE_LAT * math.cos(mid_lat_rad)
+    lat_spacing = abs(lat_max - lat_min) / (resolution - 1) * _METERS_PER_DEGREE_LAT
+    lon_spacing = abs(lon_max - lon_min) / (resolution - 1) * meters_per_deg_lon
+    return max(lat_spacing, lon_spacing)
+
+
+def resolution_for_target_spacing(bounds: tuple[float, float, float, float], target_meters: float) -> int:
+    """Grid resolution (points per axis) needed so ground_spacing_meters is
+    approximately target_meters over the given box, clamped to
+    [MIN_GRID_RESOLUTION, MAX_GRID_RESOLUTION]. A large box + a fine target
+    (e.g. "30 meters" over a 13km box) can need a resolution far beyond the
+    cap -- the caller should compare the requested target against
+    ground_spacing_meters(bounds, result) to see if it was actually
+    achievable, and tell the user if not, rather than silently returning
+    a coarser grid than they asked for."""
+    if target_meters <= 0:
+        return GRID_RESOLUTION
+    lat_min, lat_max, lon_min, lon_max = bounds
+    mid_lat_rad = math.radians((lat_min + lat_max) / 2)
+    meters_per_deg_lon = _METERS_PER_DEGREE_LAT * math.cos(mid_lat_rad)
+    lat_span_m = abs(lat_max - lat_min) * _METERS_PER_DEGREE_LAT
+    lon_span_m = abs(lon_max - lon_min) * meters_per_deg_lon
+    span_m = max(lat_span_m, lon_span_m)
+    resolution = math.ceil(span_m / target_meters) + 1
+    return max(MIN_GRID_RESOLUTION, min(resolution, MAX_GRID_RESOLUTION))
 
 
 class RealWorldDataset:

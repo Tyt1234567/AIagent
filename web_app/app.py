@@ -48,6 +48,8 @@ from geoai_agent.real_data import (
     bounding_box_around_point,
     build_real_world_dataset,
     geocode_place,
+    ground_spacing_meters,
+    resolution_for_target_spacing,
 )
 from geoai_agent.visualize import critical_points_to_geojson, field_to_geojson
 
@@ -417,6 +419,17 @@ def realworld_smart_query():
         bounds = bounding_box_around_point(geocoded["latitude"], geocoded["longitude"])
         resolved_place = geocoded
 
+    resolution = None
+    achieved_meters = None
+    requested_meters = extraction.get("target_resolution_meters")
+    if requested_meters:
+        try:
+            requested_meters = float(requested_meters)
+            resolution = resolution_for_target_spacing(bounds, requested_meters)
+            achieved_meters = ground_spacing_meters(bounds, resolution)
+        except (TypeError, ValueError):
+            requested_meters = None
+
     lat_min, lat_max, lon_min, lon_max = bounds
     return jsonify({
         "bounds": [lat_min, lat_max, lon_min, lon_max],
@@ -424,6 +437,9 @@ def realworld_smart_query():
         "available_variables": list(OPEN_METEO_VARIABLES),
         "query": query,
         "resolved_place": resolved_place,
+        "resolution": resolution,
+        "requested_resolution_meters": requested_meters,
+        "achieved_resolution_meters": achieved_meters,
     })
 
 
