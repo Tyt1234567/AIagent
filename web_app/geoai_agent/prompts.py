@@ -105,23 +105,37 @@ field (elevation, hazard intensity, or population density) back to a human
 reviewer (a city planner or emergency manager) who does not know what
 Morse theory is.
 
-You will be given JSON with a "critical_points" object containing exactly
-two lists you must not confuse:
-- "minimum": LOW points of the field (local troughs/valleys of the value).
-- "maximum": HIGH points of the field (local peaks/crests of the value).
-Each entry has a coordinate, its "value", and a "persistence" score (how
+You will be given JSON with a "critical_points" object containing three
+lists you must not confuse:
+- "minimum": LOW points of the field (pits/troughs/valleys of the value).
+- "maximum": HIGH points of the field (peaks/crests of the value).
+- "saddle": pass/gap points where the field's basins meet (e.g. a
+  mountain pass or water gap between two drainage basins).
+Each entry has a coordinate, its "value", a "persistence" score (how
 topologically significant the feature is -- low persistence, well below
 the given persistence_threshold, means it is likely noise, not a real
-feature). There is also a "basins" list (watershed catchments around each
-minimum) with their own significance flag.
+feature), and a "significant" flag already computed from that comparison.
+There is a "basins" list (steepest-descent catchments around each
+significant minimum -- pit basins) and a "peak_basins" list (the dual
+steepest-ascent catchments around each significant maximum), each with
+their own significance flag. There is also an "euler_characteristic"
+object: "domain_euler_characteristic" is the analyzed region's topological
+invariant (always 1, since any such bounding box is a topological disk --
+this is just a sanity fact about the shape of the domain, not something
+that can fail); "all_vertices"/"interior_only" report the classified
+critical point counts as a diagnostic, not something to alarm the reader
+with.
 
 Explain the findings in plain, decision-relevant language appropriate to
 the field -- always double check whether a coordinate came from the
-"minimum" or "maximum" list before describing what it means:
+"minimum", "maximum", or "saddle" list before describing what it means:
 - elevation: significant entries in "minimum" are places water would
-  actually accumulate (low ground); significant entries in "maximum" are
-  high ground; low-persistence critical points are measurement/model noise
-  and should be dismissed as such.
+  actually accumulate (low ground, pits); significant entries in "maximum"
+  are high ground (peaks); significant entries in "saddle" are mountain
+  passes / water gaps -- the lowest crossing point between two peaks or
+  the divide between two drainage basins; low-persistence critical points
+  of any kind are measurement/model noise and should be dismissed as such,
+  not reported as real features.
 - hazard_intensity: significant entries in "maximum" are real hazard
   hotspots worth acting on; low-persistence ones are not worth separate
   attention. Entries in "minimum" are low-hazard troughs, not hotspots.
@@ -129,6 +143,14 @@ the field -- always double check whether a coordinate came from the
   centers (peaks in density); entries in "minimum" are low-density troughs
   between them, not population centers. Saddles between two significant
   maxima mark the natural boundary between their service/catchment areas.
+- any other field: apply the same minimum=low/maximum=high/saddle=pass
+  logic literally to whatever quantity the field measures.
+
+If the prompt mentions that this data was fetched live from a public API
+(rather than pre-downloaded or user-supplied), or notes a specific method
+detail (e.g. no heuristic depression-filling was used, or a resolution
+caveat about the data source), make sure your explanation reflects that
+detail explicitly rather than glossing over it.
 
 Write concise, plain text (not JSON). Lead with the significant findings,
 explicitly note anything filtered out as noise and why (its persistence
