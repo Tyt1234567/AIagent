@@ -160,39 +160,70 @@ def geocode_place(place_name: str) -> dict | None:
     return None
 
 
-_PLACE_PREPOSITION_RE = re.compile(r"\b(?:in|near|around|at)\s+(.+)$", re.IGNORECASE)
-_PLACE_TOKEN_RE = re.compile(r"[A-Za-z0-9.'-]+|,")
+_PLACE_PREPOSITION_RE = re.compile(r"\b(?:in|near|around|at|from|for)\s+(.+)$", re.IGNORECASE)
+_PLACE_QUALIFIER_RE = re.compile(
+    r"\s+(?:without|with|using|sampled|resolution|grid|to extract|to find|to identify|"
+    r"so that|while|and then|and)\b",
+    re.IGNORECASE,
+)
 
 
-def extract_place_candidate(text: str) -> str | None:
-    """Heuristic extraction of a place name from free text, e.g. "find
-    critical points in College Park, MD" -> "College Park, MD". Takes the
-    text after the LAST locative preposition (in/near/around/at), so an
-    earlier non-locative "in" ("peaks in the data") doesn't win over an
-    actual place mention later in the sentence, then keeps a prefix of
-    tokens that looks like a proper-noun place name (Capitalized words,
-    ALL-CAPS abbreviations, numbers, commas), stopping at the first
-    ordinary lowercase word. This is what lets it strip an arbitrary
-    trailing qualifier clause ("...College Park, MD, with a resolution of
-    30 meters" -> "College Park, MD") without having to enumerate every
-    possible qualifier phrasing. Best-effort only -- the caller should
-    treat a failed geocode of the result as "couldn't find a location"
-    rather than retrying indefinitely."""
+def extract_place_candidates(text: str) -> list[str]:
+    """Best-effort place-name candidates to try geocoding, most to least
+    specific. Takes the text after the LAST locative preposition
+    (in/near/around/at/from/for), so an earlier non-locative "in" ("peaks
+    in the data") doesn't win over an actual place mention later in the
+    sentence. Deliberately does NOT assume proper capitalization (real
+    queries are often typed lowercase) -- instead strips a known trailing
+    qualifier phrase and caps at two comma-separated segments as a fast
+    path, then falls back to progressively dropping trailing words so
+    unusual qualifier phrasing that slips past the keyword list still
+    resolves eventually. The caller should try each candidate against
+    geocode_place() in order and stop at the first hit."""
     stripped = text.strip().rstrip(".!?")
     matches = list(_PLACE_PREPOSITION_RE.finditer(stripped))
     if not matches:
-        return None
+        return []
     tail = matches[-1].group(1).strip()
 
-    kept = []
-    for tok in _PLACE_TOKEN_RE.findall(tail):
-        if tok == "," or tok[0].isupper() or tok.isupper() or tok[0].isdigit():
-            kept.append(tok)
-        else:
-            break
+    cleaned = _PLACE_QUALIFIER_RE.split(tail, maxsplit=1)[0].strip().rstrip(",").strip()
+    parts = [p.strip() for p in cleaned.split(",") if p.strip()]
+    if len(parts) > 2:
+        cleaned = ", ".join(parts[:2])
 
-    candidate = " ".join(kept).replace(" ,", ",").strip(", ")
-    return candidate or None
+    candidates = [cleaned] if cleaned else []
+    if len(parts) >= 2:
+        # "Denver, CO at a" (trailing junk survives after the state, e.g.
+        # from a qualifier phrase the keyword split missed) still has a
+        # clean "Denver, <state>" prefix -- try just the first word of the
+        # region segment before falling back to word-by-word trimming,
+        # which would otherwise strip the comma entirely and lose the
+        # state-abbreviation-expansion path in geocode_place().
+        region_first_word = parts[1].split()[0] if parts[1].split() else ""
+        if region_first_word:
+            candidates.append(f"{parts[0]}, {region_first_word}")
+    if parts:
+        candidates.append(parts[0])
+    words = cleaned.replace(",", " ").split()
+    for cut in range(len(words) - 1, 1, -1):
+        candidates.append(" ".join(words[:cut]))
+
+    seen, out = set(), []
+    for c in candidates:
+        if c and c.lower() not in seen:
+            seen.add(c.lower())
+            out.append(c)
+    return out
+
+
+def geocode_from_text(text: str) -> dict | None:
+    """Extracts place-name candidates from free text and geocodes the
+    first one that resolves. Returns None if no candidate resolves."""
+    for candidate in extract_place_candidates(text):
+        result = geocode_place(candidate)
+        if result is not None:
+            return result
+    return None
 
 
 def bounding_box_around_point(

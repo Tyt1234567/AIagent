@@ -41,8 +41,7 @@ from geoai_agent.real_data import (
     OPEN_METEO_VARIABLES,
     bounding_box_around_point,
     build_real_world_dataset,
-    extract_place_candidate,
-    geocode_place,
+    geocode_from_text,
     infer_variable_from_text,
     parse_bounds_from_text,
 )
@@ -280,13 +279,11 @@ def realworld_smart_query():
             # No explicit lat/lon in the text -- try resolving a named
             # place (e.g. "College Park, MD") via live geocoding instead
             # of making the user look up and type coordinates themselves.
-            candidate = extract_place_candidate(query)
-            geocoded = geocode_place(candidate) if candidate else None
+            geocoded = geocode_from_text(query)
             if geocoded is None:
                 return jsonify({
                     "error": (
-                        f"Couldn't find a real-world location in that text"
-                        f"{f' (tried geocoding \"{candidate}\")' if candidate else ''}. "
+                        "Couldn't find a real-world location in that text. "
                         "Try naming a place more explicitly (e.g. \"...in Boulder, Colorado\"), "
                         "an explicit lat/lon box like '40.96N-41.15N, 75.15W-74.95W', "
                         "or use the manual Bounds field above instead."
