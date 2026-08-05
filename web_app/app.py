@@ -291,12 +291,18 @@ def realworld_load_data():
 
     dataset_id = _cache_dataset(dataset)
     layers = {name: {"field": field_to_geojson(field)} for name, field in dataset.scalar_fields.items()}
+    fell_back = primary_variable == "elevation" and elevation_source == "open_meteo" and dataset.elevation_source == "usgs"
 
     lat_min, lat_max, lon_min, lon_max = bounds
     return jsonify({
         "dataset_id": dataset_id,
         "bounds": [[lat_min, lon_min], [lat_max, lon_max]],
         "layers": layers,
+        "elevation_source": dataset.elevation_source,
+        "elevation_source_fallback_note": (
+            "Open-Meteo's elevation API failed (rate limit or outage), so this automatically "
+            "used USGS 3DEP instead."
+        ) if fell_back else None,
     })
 
 
@@ -329,6 +335,7 @@ def realworld_analyze():
         finally:
             for p in tmp_paths:
                 Path(p).unlink(missing_ok=True)
+        elevation_source = dataset.elevation_source  # may have been upgraded by an automatic fallback
 
     results = {name: analyze_scalar_field(field) for name, field in dataset.scalar_fields.items()}
 
@@ -377,6 +384,7 @@ def realworld_analyze():
         "bounds": [[lat_min, lon_min], [lat_max, lon_max]],
         "layers": layers,
         "recommendation": recommendation,
+        "elevation_source": elevation_source,
     })
 
 

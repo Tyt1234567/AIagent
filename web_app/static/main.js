@@ -310,6 +310,7 @@ async function loadRawDataPreview() {
     const data = await res.json();
     if (!res.ok) throw new Error(data.error || "request failed");
     rwDatasetId = data.dataset_id;
+    if (data.elevation_source) rwElevationSource = data.elevation_source;
 
     realworldMap.fitBounds(data.bounds);
     clearRealworldOverlays();
@@ -324,7 +325,8 @@ async function loadRawDataPreview() {
       if (first) { field.addTo(realworldMap); first = false; }
     }
     realworldLayerControl = L.control.layers(null, realworldOverlays, { collapsed: false }).addTo(realworldMap);
-    setStatus("rw-status", "Raw data loaded -- click \"Fetch & Analyze\" to find critical points.");
+    setStatus("rw-status", data.elevation_source_fallback_note ||
+      "Raw data loaded -- click \"Fetch & Analyze\" to find critical points.");
   } catch (err) {
     setStatus("rw-status", "Error loading raw data: " + err.message, true);
   }
