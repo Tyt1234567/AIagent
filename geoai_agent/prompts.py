@@ -200,7 +200,8 @@ Respond with a single JSON object with this exact shape:
 {
   "place_name": "<a place name suitable for a live geocoding search, or null>",
   "explicit_bounds": [lat_min, lat_max, lon_min, lon_max] or null,
-  "variable": "elevation" | "temperature_2m" | "precipitation" | "wind_speed_10m" | "relative_humidity_2m" | "surface_pressure"
+  "variable": "elevation" | "temperature_2m" | "precipitation" | "wind_speed_10m" | "relative_humidity_2m" | "surface_pressure",
+  "target_resolution_meters": <number, or null>
 }
 
 Rules:
@@ -223,6 +224,12 @@ Rules:
   wind -> "wind_speed_10m"; moisture -> "relative_humidity_2m";
   barometric -> "surface_pressure"). Default to "elevation" if the query
   doesn't clearly name a different topic.
+- "target_resolution_meters": if the query names a target ground
+  resolution/pixel size/sample spacing in meters (e.g. "with a resolution
+  of 30 meters", "at 1m resolution", "sampled every 100m"), extract just
+  the number here. This is a physical ground distance, not a grid point
+  count -- the app converts it to a grid size itself. If no such distance
+  is mentioned, set this to null (do not guess a default).
 Only return the JSON object, nothing else."""
 
 

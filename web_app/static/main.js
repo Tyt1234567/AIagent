@@ -466,14 +466,27 @@ function renderSmartQueryClarify(data) {
   document.getElementById("rw-bounds").value =
     [latMin, latMax, lonMin, lonMax].map((v) => v.toFixed(5)).join(",");
   document.getElementById("rw-variable").value = data.variable;
-  updateGroundResolutionHint();
+
+  let resolutionLine = "";
+  if (data.resolution) {
+    document.getElementById("rw-resolution").value = data.resolution;
+    const requested = data.requested_resolution_meters;
+    const achieved = data.achieved_resolution_meters;
+    const closeEnough = achieved <= requested * 1.1; // within ~10% counts as "hit the target"
+    resolutionLine = closeEnough
+      ? `<br><b>Grid resolution:</b> set to ${data.resolution} (~${Math.round(achieved)}m between samples, close to the requested ${requested}m).`
+      : `<br><b>Grid resolution:</b> capped at ${data.resolution} (the max supported) -- this bounding box is too large to ` +
+        `actually reach ${requested}m; the closest achievable is ~${Math.round(achieved)}m. Shrink the bounding box for finer resolution.`;
+  }
 
   document.getElementById("sq-clarify-summary").innerHTML =
     `<b>Bounding box:</b> ${latMin.toFixed(3)}, ${latMax.toFixed(3)}, ${lonMin.toFixed(3)}, ${lonMax.toFixed(3)}` +
     placeLine +
     `<br><b>Topic:</b> ${data.variable}` +
+    resolutionLine +
     `<br>Loading the raw data now -- once it's on the map, click "Fetch &amp; Analyze" to find critical points.`;
   document.getElementById("sq-clarify").hidden = false;
+  updateGroundResolutionHint();
 
   loadRawDataPreview(); // fetch the raw field as soon as the location is confirmed, not at the end of the pipeline
 }

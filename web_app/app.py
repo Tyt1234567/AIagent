@@ -44,10 +44,14 @@ from geoai_agent.data import DOMAIN_BOUNDS, GeoDataset
 from geoai_agent.llm_client import LLMClient
 from geoai_agent.morse_topology import analyze_scalar_field
 from geoai_agent.real_data import (
+    MAX_GRID_RESOLUTION,
+    MIN_GRID_RESOLUTION,
     OPEN_METEO_VARIABLES,
     bounding_box_around_point,
     build_real_world_dataset,
     geocode_place,
+    ground_spacing_meters,
+    resolution_for_target_spacing,
 )
 from geoai_agent.visualize import critical_points_to_geojson, field_to_geojson
 
@@ -228,11 +232,7 @@ def _parse_realworld_form():
         resolution = int(request.form.get("resolution", 20))
     except ValueError:
         return {"error": "resolution must be an integer"}, 400
-    # The Morse engine itself is fast even at high resolution (100x100 is
-    # under half a second); the real cost is live HTTP fetch batches (100
-    # coordinates per request), which scale with resolution^2. 80 keeps a
-    # worst-case request in the tens-of-seconds range rather than minutes.
-    resolution = max(6, min(resolution, 80))
+    resolution = max(MIN_GRID_RESOLUTION, min(resolution, MAX_GRID_RESOLUTION))
 
     primary_variable = request.form.get("primary_variable", "elevation")
     if primary_variable not in OPEN_METEO_VARIABLES:
@@ -417,6 +417,17 @@ def realworld_smart_query():
         bounds = bounding_box_around_point(geocoded["latitude"], geocoded["longitude"])
         resolved_place = geocoded
 
+    resolution = None
+    achieved_meters = None
+    requested_meters = extraction.get("target_resolution_meters")
+    if requested_meters:
+        try:
+            requested_meters = float(requested_meters)
+            resolution = resolution_for_target_spacing(bounds, requested_meters)
+            achieved_meters = ground_spacing_meters(bounds, resolution)
+        except (TypeError, ValueError):
+            requested_meters = None
+
     lat_min, lat_max, lon_min, lon_max = bounds
     return jsonify({
         "bounds": [lat_min, lat_max, lon_min, lon_max],
@@ -424,6 +435,9 @@ def realworld_smart_query():
         "available_variables": list(OPEN_METEO_VARIABLES),
         "query": query,
         "resolved_place": resolved_place,
+        "resolution": resolution,
+        "requested_resolution_meters": requested_meters,
+        "achieved_resolution_meters": achieved_meters,
     })
 
 
