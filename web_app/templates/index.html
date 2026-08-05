@@ -25,10 +25,10 @@
       <p class="hint">Routes to geometry tools, network topology, or discrete-Morse
         scalar-field analysis over the synthetic town, depending on the question.</p>
       <textarea id="town-query" rows="3" placeholder="e.g. Where would floodwater actually pool in this town, and how significant are those low points compared to noise?"></textarea>
-      <button id="town-submit">Ask</button>
+      <button id="town-submit" class="primary">Ask</button>
 
       <div id="town-examples" class="examples">
-        <span class="hint">Examples:</span>
+        <span class="hint">Examples</span>
         <ul>
           <li data-example="Which bridge should we reinforce first, considering flood risk and the population that depends on it to reach the hospital?">Which bridge should we reinforce first?</li>
           <li data-example="What is the area of zone_cluster_a?">What is the area of zone_cluster_a?</li>
@@ -37,19 +37,20 @@
         </ul>
       </div>
 
-      <div id="town-result" class="result-box" hidden>
+      <div id="town-status" class="status"></div>
+
+      <div id="town-result" class="card" hidden>
         <h3 id="town-route-label"></h3>
         <pre id="town-recommendation"></pre>
         <div id="town-feedback-box">
-          <label for="town-feedback">Feedback (optional) -- re-runs the pipeline with this folded in:</label>
+          <label for="town-feedback">Not satisfied? Say what's wrong -- re-runs with this folded in</label>
           <textarea id="town-feedback" rows="2" placeholder="e.g. ignore flood risk, focus on accessibility only"></textarea>
           <div class="button-row">
-            <button id="town-accept">Accept</button>
-            <button id="town-rerun">Re-run with feedback</button>
+            <button id="town-rerun" class="primary">Re-run with feedback</button>
+            <button id="town-accept" class="secondary">Accept</button>
           </div>
         </div>
       </div>
-      <div id="town-status" class="status"></div>
     </div>
     <div id="town-map" class="map"></div>
   </section>
@@ -57,78 +58,49 @@
   <section id="tab-realworld" class="tab-panel">
     <div class="sidebar">
       <h2>Describe what to analyze</h2>
-      <p class="hint">Mention a real lat/lon bounding box and, optionally, a topic (terrain,
-        temperature, precipitation, wind, humidity, pressure) -- everything is fetched live at
-        request time, never pre-downloaded. Nothing runs until you confirm what was understood.</p>
-      <textarea id="sq-query" rows="4" placeholder="e.g. Analyze peaks, pits, and saddle-point water gaps in the terrain of the Delaware Water Gap (40.96N-41.15N, 75.15W-74.95W)"></textarea>
-      <button id="sq-parse">Parse query</button>
-      <p class="hint">Parsing only fills in the fields below (bounds, topic) -- it does not fetch
-        anything by itself. Review them, then use the single "Fetch &amp; Analyze" button below.</p>
+      <p class="hint">Name a real place or a lat/lon box, and optionally a topic (terrain,
+        temperature, precipitation, wind, humidity, pressure) and a target resolution --
+        everything is fetched live, never pre-downloaded.</p>
+      <textarea id="sq-query" rows="3" placeholder="e.g. Analyze peaks, pits, and saddle-point water gaps in the terrain of the Delaware Water Gap (40.96N-41.15N, 75.15W-74.95W)"></textarea>
+      <button id="sq-parse" class="primary">Parse query</button>
       <div id="sq-status" class="status"></div>
-      <div id="sq-clarify" class="result-box" hidden>
-        <div id="sq-clarify-summary"></div>
+
+      <div class="settings-summary">
+        <div class="settings-row">
+          <label for="rw-bounds">Bounding box</label>
+          <input id="rw-bounds" type="text" value="39.95,40.05,-105.35,-105.25">
+        </div>
+        <div class="settings-row">
+          <label for="rw-variable">Topic</label>
+          <select id="rw-variable">
+            <option value="elevation" selected>elevation</option>
+            <option value="temperature_2m">temperature_2m</option>
+            <option value="precipitation">precipitation</option>
+            <option value="wind_speed_10m">wind_speed_10m</option>
+            <option value="relative_humidity_2m">relative_humidity_2m</option>
+            <option value="surface_pressure">surface_pressure</option>
+          </select>
+        </div>
+        <p class="hint">Default: Boulder, CO Flatirons. Use "Parse query" above to fill these in
+          from a description instead, or edit them directly.</p>
+        <button id="rw-advanced-open" type="button" class="link-btn">&#9881; Advanced options</button>
       </div>
 
-      <hr>
-
-      <h2>Bounding box and topic</h2>
-      <label for="rw-bounds">Bounding box (lat_min,lat_max,lon_min,lon_max)</label>
-      <input id="rw-bounds" type="text" value="39.95,40.05,-105.35,-105.25">
-      <p class="hint">Default: Boulder, CO Flatirons foothills. Set this directly, or use "Parse
-        query" above to fill it in from a place name or description.</p>
-
-      <label for="rw-variable">Topic</label>
-      <select id="rw-variable">
-        <option value="elevation" selected>elevation</option>
-        <option value="temperature_2m">temperature_2m</option>
-        <option value="precipitation">precipitation</option>
-        <option value="wind_speed_10m">wind_speed_10m</option>
-        <option value="relative_humidity_2m">relative_humidity_2m</option>
-        <option value="surface_pressure">surface_pressure</option>
-      </select>
-      <p class="hint">Fetched live -- for elevation, "Parse query" above automatically picks
-        Open-Meteo (fast, global, ~90m) or USGS 3DEP (genuinely ~1m LiDAR-derived, US-only, slower)
-        based on what the query actually asks for; manual entry here always uses Open-Meteo. A
-        "slope" layer is derived from elevation automatically. To supply your own data for this
-        topic instead, add a custom layer below named exactly the same as the topic (e.g. "elevation").</p>
-
-      <label for="rw-resolution">Grid resolution</label>
-      <input id="rw-resolution" type="number" value="20" min="6" max="80">
-      <p class="hint" id="rw-ground-resolution">~ meters between sample points</p>
-      <p class="hint">Higher resolution means more, closer-together sample points -- but Open-Meteo's
-        elevation data is itself only ~90m resolution, so sampling much finer than that just re-queries
-        the same underlying pixels. Shrinking the bounding box (not just raising resolution) is what
-        actually gets you closer to the ~90m floor; going below that needs a real high-res source
-        (e.g. LiDAR), which you can supply yourself as a custom layer named "elevation" below. Higher
-        resolution also means more live API calls -- 80 can take tens of seconds.</p>
-
-      <label><input id="rw-sample" type="checkbox"> Include bundled sample layer (hazard_survey)</label>
-
-      <p class="hint">Add your own data as an extra layer: a CSV (header
-        <code>x,y,value</code>) or an ESRI shapefile (a .zip bundling .shp/.shx/.dbf,
-        with a POINT geometry and a "value" attribute field). Describe what it measures
-        so the recommendation can interpret it correctly.</p>
-      <div id="rw-custom-layers"></div>
-      <button id="rw-add-layer" type="button">+ Add custom layer (CSV or shapefile)</button>
-
-      <label><input id="rw-recommend" type="checkbox" checked> Generate LLM recommendation</label>
-
-      <button id="rw-submit">Fetch &amp; Analyze</button>
-
+      <button id="rw-submit" class="primary large">Fetch &amp; Analyze</button>
       <div id="rw-status" class="status"></div>
 
-      <div id="rw-result" class="result-box" hidden>
+      <div id="rw-result" class="card" hidden>
         <h3>Layers</h3>
         <div id="rw-layer-summaries"></div>
         <h3>Recommendation</h3>
         <pre id="rw-recommendation"></pre>
         <div id="rw-feedback-box">
           <label for="rw-feedback">Not satisfied? Say what's wrong -- re-runs the analysis with
-            this folded into the recommendation:</label>
+            this folded into the recommendation</label>
           <textarea id="rw-feedback" rows="2" placeholder="e.g. you're describing temperature/weather, but this is an elevation analysis -- talk about terrain only"></textarea>
           <div class="button-row">
-            <button id="rw-accept">Accept</button>
-            <button id="rw-rerun">Re-run with feedback</button>
+            <button id="rw-rerun" class="primary">Re-run with feedback</button>
+            <button id="rw-accept" class="secondary">Accept</button>
           </div>
         </div>
       </div>
@@ -137,6 +109,52 @@
   </section>
 
 </main>
+
+<!-- Smart Query confirmation popup: shown right after Parse, before any data is fetched -->
+<div id="sq-modal" class="modal-overlay" hidden>
+  <div class="modal">
+    <h3>Confirm before loading data</h3>
+    <div id="sq-clarify-summary"></div>
+    <div class="button-row">
+      <button id="sq-modal-confirm" class="primary">Looks good, load data</button>
+      <button id="sq-modal-edit" class="secondary">I'll edit it myself</button>
+    </div>
+  </div>
+</div>
+
+<!-- Advanced options popup: resolution, sample layer, custom layers, recommendation toggle -->
+<div id="rw-advanced-modal" class="modal-overlay" hidden>
+  <div class="modal">
+    <h3>Advanced options</h3>
+
+    <label for="rw-resolution">Grid resolution</label>
+    <input id="rw-resolution" type="number" value="20" min="6" max="80">
+    <p class="hint" id="rw-ground-resolution">~ meters between sample points</p>
+    <p class="hint">Higher resolution means more, closer-together sample points -- but Open-Meteo's
+      elevation data is itself only ~90m resolution, so sampling much finer than that just re-queries
+      the same underlying pixels. Shrinking the bounding box (not just raising resolution) is what
+      actually gets you closer to the ~90m floor. "Parse query" automatically picks USGS 3DEP
+      (genuinely ~1m LiDAR-derived, US-only, slower) instead of Open-Meteo when a query explicitly
+      asks for high-resolution terrain; manual entry here always uses Open-Meteo. Higher resolution
+      also means more live API calls -- 80 can take tens of seconds.</p>
+
+    <label><input id="rw-sample" type="checkbox"> Include bundled sample layer (hazard_survey)</label>
+
+    <p class="hint">Add your own data as an extra layer: a CSV (header
+      <code>x,y,value</code>) or an ESRI shapefile (a .zip bundling .shp/.shx/.dbf,
+      with a POINT geometry and a "value" attribute field). Describe what it measures
+      so the recommendation can interpret it correctly. Naming a layer the same as the
+      Topic above (e.g. "elevation") overrides the live fetch with your own data.</p>
+    <div id="rw-custom-layers"></div>
+    <button id="rw-add-layer" type="button" class="secondary">+ Add custom layer</button>
+
+    <label><input id="rw-recommend" type="checkbox" checked> Generate LLM recommendation</label>
+
+    <div class="button-row">
+      <button id="rw-advanced-close" class="primary">Done</button>
+    </div>
+  </div>
+</div>
 
 <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
 <script src="{{ url_for('static', filename='main.js') }}"></script>

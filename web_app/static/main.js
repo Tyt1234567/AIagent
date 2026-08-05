@@ -22,6 +22,26 @@ function setStatus(id, message, isError) {
   el.classList.toggle("error", !!isError);
 }
 
+// -- modals -----------------------------------------------------------------
+
+function openModal(id) {
+  document.getElementById(id).hidden = false;
+}
+
+function closeModal(id) {
+  document.getElementById(id).hidden = true;
+}
+
+document.querySelectorAll(".modal-overlay").forEach((overlay) => {
+  overlay.addEventListener("click", (e) => {
+    if (e.target === overlay) overlay.hidden = true; // click outside the modal card closes it
+  });
+});
+document.addEventListener("keydown", (e) => {
+  if (e.key !== "Escape") return;
+  document.querySelectorAll(".modal-overlay").forEach((overlay) => { overlay.hidden = true; });
+});
+
 // -- shared GeoJSON -> Leaflet layer helpers -------------------------------
 
 function fieldLayer(geojson) {
@@ -236,6 +256,9 @@ function previewBounds(bounds, popupText) {
   realworldMap.fitBounds(leafletBounds, { maxZoom: 13 });
 }
 
+document.getElementById("rw-advanced-open").addEventListener("click", () => openModal("rw-advanced-modal"));
+document.getElementById("rw-advanced-close").addEventListener("click", () => closeModal("rw-advanced-modal"));
+
 let customLayerCount = 0;
 document.getElementById("rw-add-layer").addEventListener("click", () => {
   customLayerCount += 1;
@@ -444,7 +467,6 @@ async function submitSmartQueryParse() {
     setStatus("sq-status", "Describe what to analyze first.", true);
     return;
   }
-  document.getElementById("sq-clarify").hidden = true;
   setStatus("sq-status", "Parsing bounding box and topic...");
 
   const formData = new FormData();
@@ -505,15 +527,20 @@ function renderSmartQueryClarify(data) {
     placeLine +
     `<br><b>Topic:</b> ${data.variable}` +
     resolutionLine +
-    sourceLine +
-    `<br>Loading the raw data now -- once it's on the map, click "Fetch &amp; Analyze" to find critical points.`;
-  document.getElementById("sq-clarify").hidden = false;
+    sourceLine;
   updateGroundResolutionHint();
-
-  loadRawDataPreview(); // fetch the raw field as soon as the location is confirmed, not at the end of the pipeline
+  openModal("sq-modal"); // confirm before loading anything -- especially important for the slow USGS path
 }
 
 document.getElementById("sq-parse").addEventListener("click", submitSmartQueryParse);
+document.getElementById("sq-modal-confirm").addEventListener("click", () => {
+  closeModal("sq-modal");
+  loadRawDataPreview(); // fetch the raw field as soon as the location is confirmed, not at the end of the pipeline
+});
+document.getElementById("sq-modal-edit").addEventListener("click", () => {
+  closeModal("sq-modal");
+  setStatus("sq-status", "Edit the fields below, then click \"Fetch & Analyze\" when ready.");
+});
 
 // -- init ---------------------------------------------------------------
 
