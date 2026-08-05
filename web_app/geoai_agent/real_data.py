@@ -7,9 +7,13 @@ synthetic town in data.py. Feeds the same generic Morse engine
 Two ways to get a layer's data onto the analysis grid:
 - User-supplied CSV of scattered (x, y, value) samples, interpolated onto
   the grid with inverse-distance weighting (pure numpy, no scipy).
-- Online fetch: real elevation from the Open-Meteo elevation API
-  (https://open-meteo.com/en/docs/elevation-api), free and keyless. The API
-  caps each request at 100 coordinate pairs, so requests are batched.
+- Online fetch, live at request time (nothing is ever pre-downloaded or
+  cached to disk): any of several free, keyless Open-Meteo endpoints --
+  terrain elevation, or a live current-conditions weather variable
+  (temperature, precipitation, wind speed, humidity, surface pressure).
+  This is deliberately not elevation-only: OPEN_METEO_VARIABLES is a small
+  registry so the same fetch/analysis path works for whichever topic a
+  query is actually about (see infer_variable_from_text).
 
 A "slope" layer (gradient magnitude of elevation) is derived for free from
 whatever elevation data is loaded, giving a second genuinely real layer
@@ -21,6 +25,7 @@ from __future__ import annotations
 
 import csv
 import json
+import re
 import urllib.request
 import urllib.parse
 
@@ -29,8 +34,68 @@ import numpy as np
 from geoai_agent.morse_topology import ScalarField
 
 GRID_RESOLUTION = 20
-_ELEVATION_BATCH = 100
-_ELEVATION_URL = "https://api.open-meteo.com/v1/elevation"
+_FETCH_BATCH = 100  # conservative shared batch size, verified against the elevation endpoint's limit
+
+# Every entry is a live, keyless Open-Meteo endpoint. "elevation" hits the
+# dedicated elevation API; everything else hits the forecast API's
+# `current=<variable>` field, which returns live current-conditions data
+# (not historical/cached) for each requested coordinate.
+OPEN_METEO_VARIABLES: dict[str, dict] = {
+    "elevation": {"keywords": ["elevation", "terrain", "dem", "lidar", "height", "altitude", "topograph"]},
+    "temperature_2m": {"keywords": ["temperature", "heat", "warm", "cold", "thermal"]},
+    "precipitation": {"keywords": ["precipitation", "rain", "rainfall", "flood", "storm", "wet"]},
+    "wind_speed_10m": {"keywords": ["wind"]},
+    "relative_humidity_2m": {"keywords": ["humidity", "moisture"]},
+    "surface_pressure": {"keywords": ["pressure", "barometric"]},
+}
+
+
+def infer_variable_from_text(text: str, default: str = "elevation") -> str:
+    """Keyword-based topic classification: which OPEN_METEO_VARIABLES entry
+    a free-text query is asking about. Deliberately not elevation-only --
+    this is what lets the real-world pipeline handle "any topic" rather
+    than assuming terrain every time. Falls back to `default` if nothing
+    matches."""
+    lower = text.lower()
+    for variable, info in OPEN_METEO_VARIABLES.items():
+        if any(kw in lower for kw in info["keywords"]):
+            return variable
+    return default
+
+
+_COORD_RE = re.compile(
+    # No leading "-?" on the number: sign comes entirely from the N/S/E/W
+    # suffix below. A leading minus would misparse "40.96N-41.15N" (a
+    # hyphen-separated range with no spaces) as if the second number were
+    # negative, since the range-separating hyphen sits directly against it.
+    r"(\d+(?:\.\d+)?)\s*"
+    r"(?:\^\s*\\?circ)?\s*"           # optional ^\circ / ^circ (LaTeX degree)
+    r"(?:[°˚]|\bdegrees?\b)?\s*"  # optional degree symbol/word
+    r"(?:\\?text\s*\{)?\s*"           # optional \text{ wrapper
+    r"([NSEWnsew])\}?"
+)
+
+
+def parse_bounds_from_text(text: str) -> tuple[float, float, float, float] | None:
+    """Extracts an explicit lat/lon bounding box from free text, e.g.
+    "40.96 N - 41.15 N, 75.15 W - 74.95 W" (also tolerates LaTeX-ish
+    markup like degree symbols / \\text{} around the number). Needs at
+    least two latitude (N/S) and two longitude (E/W) matches; returns None
+    if it can't find an unambiguous box (the caller should then fall back
+    to another route rather than guess at coordinates)."""
+    lats, lons = [], []
+    for value, direction in _COORD_RE.findall(text):
+        v = float(value)
+        d = direction.upper()
+        if d == "S":
+            v = -v
+        elif d == "W":
+            v = -v
+        (lats if d in "NS" else lons).append(v)
+
+    if len(lats) < 2 or len(lons) < 2:
+        return None
+    return (min(lats), max(lats), min(lons), max(lons))
 
 
 class RealWorldDataset:
@@ -103,29 +168,48 @@ def scalar_field_from_csv(
     return ScalarField(name=name, xs=xs, ys=ys, values=values)
 
 
-def fetch_elevation_field(
-    bounds: tuple[float, float, float, float], resolution: int = GRID_RESOLUTION,
+def fetch_open_meteo_field(
+    variable: str, bounds: tuple[float, float, float, float], resolution: int = GRID_RESOLUTION,
 ) -> ScalarField:
-    """Fetches real terrain elevation for every grid node over `bounds` from
-    the free, keyless Open-Meteo elevation API, batched at the API's ~100
-    coordinate-pair-per-request limit."""
+    """Live-fetches `variable` (a key in OPEN_METEO_VARIABLES) for every
+    grid node over `bounds` from Open-Meteo, batched at a conservative
+    coordinate-pair-per-request limit. Always a fresh HTTP request at call
+    time -- nothing is downloaded ahead of time or cached to disk."""
+    if variable not in OPEN_METEO_VARIABLES:
+        raise ValueError(f"unknown Open-Meteo variable '{variable}', available: {list(OPEN_METEO_VARIABLES)}")
+
     xs, ys = _grid(bounds, resolution)
     xx, yy = np.meshgrid(xs, ys)
     lons = xx.ravel()
     lats = yy.ravel()
+    out = np.empty(lons.shape[0], dtype=float)
 
-    elevations = np.empty(lons.shape[0], dtype=float)
-    for start in range(0, lons.shape[0], _ELEVATION_BATCH):
-        end = start + _ELEVATION_BATCH
+    for start in range(0, lons.shape[0], _FETCH_BATCH):
+        end = start + _FETCH_BATCH
         lat_param = ",".join(f"{v:.6f}" for v in lats[start:end])
         lon_param = ",".join(f"{v:.6f}" for v in lons[start:end])
-        query = urllib.parse.urlencode({"latitude": lat_param, "longitude": lon_param})
-        with urllib.request.urlopen(f"{_ELEVATION_URL}?{query}", timeout=30) as resp:
-            payload = json.loads(resp.read())
-        elevations[start:end] = payload["elevation"]
 
-    values = elevations.reshape(xx.shape)
-    return ScalarField(name="elevation", xs=xs, ys=ys, values=values)
+        if variable == "elevation":
+            query = urllib.parse.urlencode({"latitude": lat_param, "longitude": lon_param})
+            with urllib.request.urlopen(f"https://api.open-meteo.com/v1/elevation?{query}", timeout=30) as resp:
+                payload = json.loads(resp.read())
+            out[start:end] = payload["elevation"]
+        else:
+            query = urllib.parse.urlencode({"latitude": lat_param, "longitude": lon_param, "current": variable})
+            with urllib.request.urlopen(f"https://api.open-meteo.com/v1/forecast?{query}", timeout=30) as resp:
+                payload = json.loads(resp.read())
+            out[start:end] = [entry["current"][variable] for entry in payload]
+
+    values = out.reshape(xx.shape)
+    return ScalarField(name=variable, xs=xs, ys=ys, values=values)
+
+
+def fetch_elevation_field(
+    bounds: tuple[float, float, float, float], resolution: int = GRID_RESOLUTION,
+) -> ScalarField:
+    """Fetches real terrain elevation -- thin wrapper over
+    fetch_open_meteo_field kept for existing callers (real_world_example.py)."""
+    return fetch_open_meteo_field("elevation", bounds, resolution)
 
 
 def derive_slope_field(elevation: ScalarField) -> ScalarField:
@@ -156,12 +240,12 @@ def build_real_world_dataset(
     for layer_name, source in layer_sources.items():
         if source is not None:
             fields[layer_name] = scalar_field_from_csv(layer_name, source, bounds, resolution)
-        elif layer_name == "elevation":
-            fields["elevation"] = fetch_elevation_field(bounds, resolution)
+        elif layer_name in OPEN_METEO_VARIABLES:
+            fields[layer_name] = fetch_open_meteo_field(layer_name, bounds, resolution)
         else:
             raise ValueError(
-                f"layer '{layer_name}' has no CSV source and online fetch is only "
-                "available for 'elevation'"
+                f"layer '{layer_name}' has no CSV source and is not a live-fetchable "
+                f"variable (available: {list(OPEN_METEO_VARIABLES)})"
             )
 
     if include_slope and "elevation" in fields and "slope" not in fields:

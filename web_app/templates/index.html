@@ -56,7 +56,34 @@
 
   <section id="tab-realworld" class="tab-panel">
     <div class="sidebar">
-      <h2>Analyze a real place</h2>
+      <h2>Describe what to analyze</h2>
+      <p class="hint">Mention a real lat/lon bounding box and, optionally, a topic (terrain,
+        temperature, precipitation, wind, humidity, pressure) -- everything is fetched live at
+        request time, never pre-downloaded. Nothing runs until you confirm what was understood.</p>
+      <textarea id="sq-query" rows="4" placeholder="e.g. Analyze peaks, pits, and saddle-point water gaps in the terrain of the Delaware Water Gap (40.96N-41.15N, 75.15W-74.95W)"></textarea>
+      <button id="sq-parse">Parse query</button>
+      <div id="sq-status" class="status"></div>
+
+      <div id="sq-clarify" class="result-box" hidden>
+        <h3>Confirm before running</h3>
+        <div id="sq-clarify-summary"></div>
+        <label for="sq-variable">Topic to analyze</label>
+        <select id="sq-variable"></select>
+        <div id="sq-elevation-source-row" hidden>
+          <label><input type="radio" name="sq-elev-source" value="open_meteo" checked>
+            Use best-available public elevation now (~90m, Open-Meteo -- not true 1m LiDAR)</label>
+          <label><input type="radio" name="sq-elev-source" value="csv">
+            I'll upload my own high-resolution DEM CSV (e.g. USGS 3DEP LiDAR export)</label>
+          <input id="sq-csv-file" type="file" accept=".csv" hidden>
+        </div>
+        <label for="sq-resolution">Grid resolution</label>
+        <input id="sq-resolution" type="number" value="20" min="6" max="40">
+        <button id="sq-run">Fetch live &amp; analyze</button>
+      </div>
+
+      <hr>
+
+      <h2>Or set a bounding box manually</h2>
       <label for="rw-bounds">Bounding box (lat_min,lat_max,lon_min,lon_max)</label>
       <input id="rw-bounds" type="text" value="39.95,40.05,-105.35,-105.25">
       <p class="hint">Default: Boulder, CO Flatirons foothills. Elevation is always fetched

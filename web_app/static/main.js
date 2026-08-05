@@ -57,6 +57,7 @@ function pointsLayer(geojson, labelPrefix) {
 let townMap;
 let townLayerControl;
 const townOverlays = {};
+let townDynamicLayerNames = []; // layers added per-query (e.g. morse field/points) -- cleared each run
 
 function addTownOverlay(name, layer, defaultOn) {
   if (townOverlays[name]) {
@@ -64,6 +65,22 @@ function addTownOverlay(name, layer, defaultOn) {
   }
   townOverlays[name] = layer;
   if (defaultOn) layer.addTo(townMap);
+  if (townLayerControl) townMap.removeControl(townLayerControl);
+  townLayerControl = L.control.layers(null, townOverlays, { collapsed: false }).addTo(townMap);
+}
+
+// Removes only the layers added by the previous query (roads/zones/hazard/
+// population are untouched) -- without this, switching topics (e.g. an
+// elevation question followed by a hazard_intensity question) left the old
+// field's heatmap and critical-point markers stuck on the map forever.
+function clearTownDynamicOverlays() {
+  townDynamicLayerNames.forEach((name) => {
+    if (townOverlays[name]) {
+      townMap.removeLayer(townOverlays[name]);
+      delete townOverlays[name];
+    }
+  });
+  townDynamicLayerNames = [];
   if (townLayerControl) townMap.removeControl(townLayerControl);
   townLayerControl = L.control.layers(null, townOverlays, { collapsed: false }).addTo(townMap);
 }
@@ -109,6 +126,8 @@ function renderTownResult(result) {
   const rec = document.getElementById("town-recommendation");
   const feedbackBox = document.getElementById("town-feedback-box");
 
+  clearTownDynamicOverlays(); // start every new query from a clean map, regardless of route
+
   if (result.route === "geometry") {
     label.textContent = "Geometry tool result";
     rec.textContent = JSON.stringify(result.tool_result, null, 2);
@@ -122,8 +141,11 @@ function renderTownResult(result) {
   if (result.route === "morse" && result.geojson) {
     const field = fieldLayer(result.geojson.field);
     const points = pointsLayer(result.geojson.points, result.field);
-    addTownOverlay(result.field + " (field)", field, true);
-    addTownOverlay(result.field + " (critical points)", points, true);
+    const fieldName = result.field + " (field)";
+    const pointsName = result.field + " (critical points)";
+    addTownOverlay(fieldName, field, true);
+    addTownOverlay(pointsName, points, true);
+    townDynamicLayerNames.push(fieldName, pointsName);
   }
 }
 
@@ -265,11 +287,14 @@ function renderRealworldResult(data) {
     }
 
     const s = layer.summary;
+    const euler = s.euler_characteristic;
     const div = document.createElement("div");
     div.className = "layer-summary";
     div.innerHTML = `<b>${name}</b><br>range: [${s.value_range[0].toFixed(2)}, ${s.value_range[1].toFixed(2)}]
-      &nbsp;|&nbsp; significant basins: ${s.num_significant_basins}
-      &nbsp;|&nbsp; threshold: ${s.persistence_threshold.toFixed(3)}`;
+      &nbsp;|&nbsp; significant pit basins: ${s.num_significant_basins}
+      &nbsp;|&nbsp; significant peak basins: ${s.num_significant_peak_basins}
+      &nbsp;|&nbsp; threshold: ${s.persistence_threshold.toFixed(3)}
+      <br>domain Euler characteristic: ${euler.domain_euler_characteristic} (disk, expected 1)`;
     summaryContainer.appendChild(div);
   }
 
@@ -281,6 +306,110 @@ function renderRealworldResult(data) {
 }
 
 document.getElementById("rw-submit").addEventListener("click", submitRealworldAnalyze);
+
+// -- Smart Query (free-text, any topic, live-fetched) ------------------------
+
+let sqParsed = null; // {bounds, variable, query} from the last successful parse
+
+async function submitSmartQueryParse() {
+  const query = document.getElementById("sq-query").value.trim();
+  if (!query) {
+    setStatus("sq-status", "Describe what to analyze first.", true);
+    return;
+  }
+  document.getElementById("sq-clarify").hidden = true;
+  setStatus("sq-status", "Parsing bounding box and topic...");
+
+  const formData = new FormData();
+  formData.append("stage", "parse");
+  formData.append("query", query);
+
+  try {
+    const res = await fetch("/api/realworld/smart_query", { method: "POST", body: formData });
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.error || "request failed");
+    sqParsed = data;
+    renderSmartQueryClarify(data);
+    setStatus("sq-status", "");
+  } catch (err) {
+    setStatus("sq-status", "Error: " + err.message, true);
+  }
+}
+
+function renderSmartQueryClarify(data) {
+  const [latMin, latMax, lonMin, lonMax] = data.bounds;
+  document.getElementById("sq-clarify-summary").innerHTML =
+    `<b>Bounding box:</b> ${latMin.toFixed(3)}, ${latMax.toFixed(3)}, ${lonMin.toFixed(3)}, ${lonMax.toFixed(3)}` +
+    `<br><b>Inferred topic:</b> ${data.variable} -- change it below if that's wrong.`;
+
+  const select = document.getElementById("sq-variable");
+  select.innerHTML = "";
+  data.available_variables.forEach((v) => {
+    const opt = document.createElement("option");
+    opt.value = v;
+    opt.textContent = v;
+    if (v === data.variable) opt.selected = true;
+    select.appendChild(opt);
+  });
+
+  const toggleElevationRow = () => {
+    document.getElementById("sq-elevation-source-row").hidden = select.value !== "elevation";
+  };
+  select.onchange = toggleElevationRow;
+  toggleElevationRow();
+
+  document.getElementById("sq-clarify").hidden = false;
+}
+
+document.querySelectorAll('input[name="sq-elev-source"]').forEach((radio) => {
+  radio.addEventListener("change", () => {
+    document.getElementById("sq-csv-file").hidden =
+      document.querySelector('input[name="sq-elev-source"]:checked').value !== "csv";
+  });
+});
+
+async function submitSmartQueryRun() {
+  if (!sqParsed) return;
+  const variable = document.getElementById("sq-variable").value;
+  const resolution = document.getElementById("sq-resolution").value;
+  const elevSource = document.querySelector('input[name="sq-elev-source"]:checked')?.value || "open_meteo";
+
+  const formData = new FormData();
+  formData.append("stage", "run");
+  formData.append("query", sqParsed.query);
+  formData.append("bounds", sqParsed.bounds.join(","));
+  formData.append("variable", variable);
+  formData.append("resolution", resolution);
+  if (variable === "elevation") {
+    formData.append("elevation_source", elevSource);
+    if (elevSource === "csv") {
+      const file = document.getElementById("sq-csv-file").files[0];
+      if (!file) {
+        setStatus("sq-status", "Choose a CSV file first.", true);
+        return;
+      }
+      formData.append("csv_file", file);
+    }
+  }
+
+  setStatus("sq-status", `Fetching '${variable}' live and running Morse analysis...`);
+  try {
+    const res = await fetch("/api/realworld/smart_query", { method: "POST", body: formData });
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.error || "request failed");
+    renderRealworldResult(data);
+    if (data.method_note) {
+      document.getElementById("rw-recommendation").textContent =
+        (data.recommendation || "") + "\n\n[Method note: " + data.method_note + "]";
+    }
+    setStatus("sq-status", "");
+  } catch (err) {
+    setStatus("sq-status", "Error: " + err.message, true);
+  }
+}
+
+document.getElementById("sq-parse").addEventListener("click", submitSmartQueryParse);
+document.getElementById("sq-run").addEventListener("click", submitSmartQueryRun);
 
 // -- init ---------------------------------------------------------------
 

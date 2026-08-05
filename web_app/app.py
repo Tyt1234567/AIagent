@@ -37,7 +37,12 @@ from geoai_agent.agent import GeoAIAgent
 from geoai_agent.data import DOMAIN_BOUNDS, GeoDataset
 from geoai_agent.llm_client import LLMClient
 from geoai_agent.morse_topology import analyze_scalar_field
-from geoai_agent.real_data import build_real_world_dataset
+from geoai_agent.real_data import (
+    OPEN_METEO_VARIABLES,
+    build_real_world_dataset,
+    infer_variable_from_text,
+    parse_bounds_from_text,
+)
 from geoai_agent.visualize import critical_points_to_geojson, field_to_geojson
 
 app = Flask(__name__)
@@ -149,6 +154,16 @@ def town_query():
     return jsonify(response)
 
 
+def _layer_summary(result: dict) -> dict:
+    return {
+        "value_range": result["value_range"],
+        "persistence_threshold": result["persistence_threshold"],
+        "num_significant_basins": result["num_significant_basins"],
+        "num_significant_peak_basins": result["num_significant_peak_basins"],
+        "euler_characteristic": result["euler_characteristic"],
+    }
+
+
 # -- Real-World Data (online elevation + user-supplied multi-layer CSVs) --
 
 @app.route("/api/realworld/analyze", methods=["POST"])
@@ -211,11 +226,7 @@ def realworld_analyze():
         layers[name] = {
             "field": field_to_geojson(field),
             "points": critical_points_to_geojson(result),
-            "summary": {
-                "value_range": result["value_range"],
-                "persistence_threshold": result["persistence_threshold"],
-                "num_significant_basins": result["num_significant_basins"],
-            },
+            "summary": _layer_summary(result),
         }
 
     lat_min, lat_max, lon_min, lon_max = bounds
@@ -223,6 +234,145 @@ def realworld_analyze():
         "bounds": [[lat_min, lon_min], [lat_max, lon_max]],
         "layers": layers,
         "recommendation": recommendation,
+    })
+
+
+# -- Smart Query: free-text real-world queries, live-fetched, any topic --
+#
+# Two round trips, so the app can surface a decision to the user instead of
+# guessing (mirrors the CLI/agent's human-in-the-loop pattern):
+#   stage="parse" -- extract a lat/lon bounding box and infer which live
+#     variable (elevation, temperature, precipitation, wind, humidity,
+#     pressure -- see geoai_agent.real_data.OPEN_METEO_VARIABLES) the query
+#     is about; nothing is fetched yet. Returns needs_input with what was
+#     inferred so the user can confirm or correct it before anything runs.
+#   stage="run" -- the user-confirmed bounds/variable (and, for elevation,
+#     a choice between the free public DEM and their own uploaded CSV) are
+#     fetched live right now and analyzed. No data is ever pre-downloaded
+#     or cached between requests.
+
+@app.route("/api/realworld/smart_query", methods=["POST"])
+def realworld_smart_query():
+    stage = request.form.get("stage", "parse")
+    query = request.form.get("query", "").strip()
+    if not query:
+        return jsonify({"error": "query is required"}), 400
+
+    if stage == "parse":
+        bounds = parse_bounds_from_text(query)
+        if bounds is None:
+            return jsonify({
+                "error": (
+                    "Couldn't find an explicit lat/lon bounding box in that text. "
+                    "Try including one directly, e.g. '40.96N-41.15N, 75.15W-74.95W', "
+                    "or use the manual Bounds field above instead."
+                )
+            }), 400
+        variable = infer_variable_from_text(query)
+        lat_min, lat_max, lon_min, lon_max = bounds
+        return jsonify({
+            "needs_input": True,
+            "bounds": [lat_min, lat_max, lon_min, lon_max],
+            "variable": variable,
+            "available_variables": list(OPEN_METEO_VARIABLES),
+            "needs_elevation_source_choice": variable == "elevation",
+            "query": query,
+        })
+
+    # stage == "run"
+    try:
+        bounds = tuple(float(x) for x in request.form.get("bounds", "").split(","))
+        if len(bounds) != 4:
+            raise ValueError
+    except ValueError:
+        return jsonify({"error": "bounds must be 'lat_min,lat_max,lon_min,lon_max'"}), 400
+
+    variable = request.form.get("variable", "elevation")
+    if variable not in OPEN_METEO_VARIABLES:
+        return jsonify({"error": f"unknown variable '{variable}'"}), 400
+
+    try:
+        resolution = int(request.form.get("resolution", 20))
+    except ValueError:
+        return jsonify({"error": "resolution must be an integer"}), 400
+    resolution = max(6, min(resolution, 40))
+
+    elevation_source = request.form.get("elevation_source", "open_meteo")
+    tmp_path = None
+    method_note = ""
+    if variable == "elevation" and elevation_source == "csv":
+        file = request.files.get("csv_file")
+        if not file or not file.filename:
+            return jsonify({"error": "elevation_source is 'csv' but no csv_file was uploaded"}), 400
+        tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".csv")
+        file.save(tmp.name)
+        tmp.close()
+        tmp_path = tmp.name
+        method_note = (
+            "Elevation for this run came from a user-uploaded DEM CSV, not the "
+            "public Open-Meteo API."
+        )
+    else:
+        method_note = (
+            f"'{variable}' for this run was fetched live from the free, keyless "
+            "Open-Meteo API at request time (no pre-downloaded or cached data)."
+            + (
+                " Open-Meteo's public elevation API is SRTM-derived at roughly "
+                "90m resolution, not true 1-meter LiDAR; note this resolution "
+                "caveat explicitly if the user asked about fine-grained terrain."
+                if variable == "elevation" else ""
+            )
+        )
+
+    try:
+        dataset = build_real_world_dataset(
+            "smart_query", bounds, {variable: tmp_path}, resolution=resolution,
+            include_slope=(variable == "elevation"),
+        )
+    except Exception as exc:
+        return jsonify({"error": str(exc)}), 400
+    finally:
+        if tmp_path:
+            Path(tmp_path).unlink(missing_ok=True)
+
+    results = {name: analyze_scalar_field(field) for name, field in dataset.scalar_fields.items()}
+
+    method_note += (
+        " Basins/peaks were computed by persistence-guided steepest-descent/ascent "
+        "watershed directly on the raw field, with NO heuristic depression-filling "
+        "or breaching preprocessing; persistence simplification (folding "
+        "low-persistence critical-point pairs into their neighbor) is what removes "
+        "micro-scale noise instead."
+    )
+
+    recommendation = None
+    try:
+        llm = LLMClient()
+        recommendation = llm.chat(
+            prompts.MORSE_RECOMMENDATION_SYSTEM,
+            f"Original user query: {query}\n"
+            f"Method note: {method_note}\n"
+            f"Morse analysis result: {json.dumps(results[variable], ensure_ascii=False)}",
+        )
+    except Exception as exc:
+        recommendation = f"(recommendation unavailable: {exc})"
+
+    layers = {}
+    for name, field in dataset.scalar_fields.items():
+        result = results[name]
+        layers[name] = {
+            "field": field_to_geojson(field),
+            "points": critical_points_to_geojson(result),
+            "summary": _layer_summary(result),
+        }
+
+    lat_min, lat_max, lon_min, lon_max = bounds
+    return jsonify({
+        "bounds": [[lat_min, lon_min], [lat_max, lon_max]],
+        "layers": layers,
+        "recommendation": recommendation,
+        "variable": variable,
+        "method_note": method_note,
     })
 
 
