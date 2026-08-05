@@ -90,11 +90,15 @@ human review loop as the topology branch.
 | `geoai_agent/geometry_tools.py` | Standard GIS tools for the geometry-sufficient branch (area, distance, containment, buffer) |
 | `geoai_agent/topology_tools.py` | Connectivity, adjacency, and critical-structure (graph bridge) analysis over the discrete network |
 | `geoai_agent/morse_topology.py` | Discrete Morse theory over continuous scalar fields: critical point classification, persistence pairing, watershed segmentation |
+| `geoai_agent/real_data.py` | Real-world scalar field layers: online elevation fetch (Open-Meteo), user-CSV layers via IDW interpolation, derived slope layer |
+| `geoai_agent/visualize.py` | Self-contained multi-layer Leaflet map generation for Morse analysis results |
 | `geoai_agent/integration.py` | Combines topology output with hazard/population/accessibility per structure |
 | `geoai_agent/llm_client.py` | OpenAI-compatible client targeting a local Ollama server |
 | `geoai_agent/prompts.py` | System prompts and JSON schemas for each LLM-driven step |
 | `geoai_agent/agent.py` | Orchestrator implementing the full pipeline and the human feedback re-run loop |
-| `main.py` | CLI entry point |
+| `main.py` | CLI entry point (synthetic town) |
+| `real_world_example.py` | CLI entry point for real-world data, multi-layer input, and Leaflet visualization |
+| `examples/sample_hazard_layer.csv` | Example user-supplied CSV layer for `real_world_example.py` |
 
 ## Scalar field topology (discrete Morse theory)
 
@@ -119,6 +123,50 @@ It is not tied to terrain: the same code runs on `elevation`,
 `hazard_intensity`, `population_density`, or any other field later added to
 `GeoDataset.scalar_fields`. `geoai_agent/topology_tools.analyze_scalar_topology`
 is the thin dataset-aware entry point the agent calls.
+
+## Real-world data and multi-layer visualization
+
+By default the `morse_needed` branch analyzes the synthetic town's fields.
+`real_world_example.py` swaps that out for genuine data over an actual
+place, with support for multiple simultaneous layers and a Leaflet map:
+
+```
+python real_world_example.py
+```
+
+It:
+
+1. Fetches real terrain elevation for a lat/lon bounding box (default:
+   the Boulder, CO Flatirons foothills) from the free, keyless
+   [Open-Meteo elevation API](https://open-meteo.com/en/docs/elevation-api).
+2. Derives a second real layer, `slope` (gradient magnitude of the
+   elevation), at no extra data cost.
+3. Optionally loads any number of additional user-supplied layers from CSV
+   files (header `x,y,value`, x=longitude/y=latitude), interpolated onto
+   the analysis grid with inverse-distance weighting
+   (`geoai_agent/real_data.py`) -- a bundled example,
+   `examples/sample_hazard_layer.csv`, is offered interactively. Add your
+   own by entering a layer name and CSV path when prompted, or edit
+   `real_world_example.py`'s `layer_sources` dict directly.
+4. Runs the same discrete-Morse engine (`morse_topology.py`) on every
+   layer and prints a plain-language recommendation for the elevation
+   layer.
+5. Renders all layers together as a self-contained Leaflet map
+   (`geoai_agent/visualize.py`, Leaflet loaded from its CDN, no new Python
+   dependency) over a real OpenStreetMap basemap, with a layer control to
+   toggle each field's heatmap and its significant critical points on and
+   off independently. Open `real_world_map.html` in a browser.
+
+Run non-interactively with defaults only (elevation + derived slope, no
+prompts, no LLM recommendation call skipped) via:
+
+```
+python real_world_example.py --no-input
+```
+
+The synthetic-town path (`main.py`, `geoai_agent/data.py`) is unchanged and
+still used for the network-topology (`topology_needed`) branch, which needs
+the town's road graph and zones and has no real-world equivalent here.
 
 ## Configuration
 
