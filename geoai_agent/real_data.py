@@ -32,6 +32,7 @@ from __future__ import annotations
 import csv
 import json
 import re
+import urllib.error
 import urllib.request
 import urllib.parse
 
@@ -133,6 +134,7 @@ class RealWorldDataset:
     def __init__(
         self, name: str, bounds: tuple[float, float, float, float], scalar_fields: dict[str, ScalarField],
         layer_descriptions: dict[str, str] | None = None,
+        layer_sources: dict[str, str | None] | None = None,
     ):
         # bounds = (lat_min, lat_max, lon_min, lon_max)
         self.name = name
@@ -143,6 +145,10 @@ class RealWorldDataset:
         # layer actually measures -- passed to the LLM recommendation so it
         # can interpret a field it has no built-in knowledge of.
         self.layer_descriptions = layer_descriptions or {}
+        # the layer_sources this was built from (None = live-fetched,
+        # a path = user-uploaded) -- kept around so a caller that reuses a
+        # cached dataset can still correctly report where the data came from.
+        self.layer_sources = layer_sources or {}
 
 
 def _grid(bounds: tuple[float, float, float, float], resolution: int) -> tuple[np.ndarray, np.ndarray]:
@@ -266,20 +272,37 @@ def fetch_open_meteo_field(
     lats = yy.ravel()
     out = np.empty(lons.shape[0], dtype=float)
 
-    for start in range(0, lons.shape[0], _FETCH_BATCH):
+    num_batches = -(-lons.shape[0] // _FETCH_BATCH)  # ceil division
+    for batch_idx, start in enumerate(range(0, lons.shape[0], _FETCH_BATCH)):
         end = start + _FETCH_BATCH
         lat_param = ",".join(f"{v:.6f}" for v in lats[start:end])
         lon_param = ",".join(f"{v:.6f}" for v in lons[start:end])
 
         if variable == "elevation":
-            query = urllib.parse.urlencode({"latitude": lat_param, "longitude": lon_param})
-            with urllib.request.urlopen(f"https://api.open-meteo.com/v1/elevation?{query}", timeout=30) as resp:
+            url = f"https://api.open-meteo.com/v1/elevation?{urllib.parse.urlencode({'latitude': lat_param, 'longitude': lon_param})}"
+        else:
+            url = (
+                "https://api.open-meteo.com/v1/forecast?"
+                f"{urllib.parse.urlencode({'latitude': lat_param, 'longitude': lon_param, 'current': variable})}"
+            )
+        try:
+            with urllib.request.urlopen(url, timeout=30) as resp:
                 payload = json.loads(resp.read())
+        except urllib.error.HTTPError as exc:
+            reason = exc.read().decode("utf-8", errors="replace")
+            try:
+                reason = json.loads(reason).get("reason", reason)
+            except json.JSONDecodeError:
+                pass
+            raise RuntimeError(
+                f"Open-Meteo request failed on batch {batch_idx + 1}/{num_batches} "
+                f"({exc.code} {exc.reason}): {reason}. Try a lower resolution or a smaller "
+                "bounding box, or wait a moment before retrying."
+            ) from exc
+
+        if variable == "elevation":
             out[start:end] = payload["elevation"]
         else:
-            query = urllib.parse.urlencode({"latitude": lat_param, "longitude": lon_param, "current": variable})
-            with urllib.request.urlopen(f"https://api.open-meteo.com/v1/forecast?{query}", timeout=30) as resp:
-                payload = json.loads(resp.read())
             out[start:end] = [entry["current"][variable] for entry in payload]
 
     values = out.reshape(xx.shape)
@@ -342,4 +365,5 @@ def build_real_world_dataset(
 
     return RealWorldDataset(
         name=name, bounds=bounds, scalar_fields=fields, layer_descriptions=layer_descriptions,
+        layer_sources=layer_sources,
     )

@@ -92,7 +92,14 @@
         (e.g. "elevation").</p>
 
       <label for="rw-resolution">Grid resolution</label>
-      <input id="rw-resolution" type="number" value="20" min="6" max="40">
+      <input id="rw-resolution" type="number" value="20" min="6" max="80">
+      <p class="hint" id="rw-ground-resolution">~ meters between sample points</p>
+      <p class="hint">Higher resolution means more, closer-together sample points -- but Open-Meteo's
+        elevation data is itself only ~90m resolution, so sampling much finer than that just re-queries
+        the same underlying pixels. Shrinking the bounding box (not just raising resolution) is what
+        actually gets you closer to the ~90m floor; going below that needs a real high-res source
+        (e.g. LiDAR), which you can supply yourself as a custom layer named "elevation" below. Higher
+        resolution also means more live API calls -- 80 can take tens of seconds.</p>
 
       <label><input id="rw-sample" type="checkbox"> Include bundled sample layer (hazard_survey)</label>
 
@@ -114,6 +121,15 @@
         <div id="rw-layer-summaries"></div>
         <h3>Recommendation</h3>
         <pre id="rw-recommendation"></pre>
+        <div id="rw-feedback-box">
+          <label for="rw-feedback">Not satisfied? Say what's wrong -- re-runs the analysis with
+            this folded into the recommendation:</label>
+          <textarea id="rw-feedback" rows="2" placeholder="e.g. you're describing temperature/weather, but this is an elevation analysis -- talk about terrain only"></textarea>
+          <div class="button-row">
+            <button id="rw-accept">Accept</button>
+            <button id="rw-rerun">Re-run with feedback</button>
+          </div>
+        </div>
       </div>
     </div>
     <div id="realworld-map" class="map"></div>

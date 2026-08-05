@@ -29,6 +29,8 @@ from __future__ import annotations
 
 import json
 import tempfile
+import time
+import uuid
 from pathlib import Path
 
 APP_DIR = Path(__file__).resolve().parent
@@ -169,30 +171,72 @@ def _layer_summary(result: dict) -> dict:
 
 
 # -- Real-World Data: one bounding box, one topic, any number of extra ---
-# user-supplied layers. The single entry point for actually fetching and
-# analyzing anything in this panel -- Smart Query (below) only ever fills
-# in the bounds/topic fields this endpoint reads, it never fetches on its
-# own, so there is exactly one bounds/topic state and one "run" action.
+# user-supplied layers. Smart Query only ever fills in the bounds/topic
+# fields these endpoints read, it never fetches on its own, so there is
+# exactly one bounds/topic state in the UI.
+#
+# Two-phase, so raw data loads as soon as a location is confirmed rather
+# than only at the very end of the pipeline:
+#   /load_data -- fetches the raw scalar field(s) only (no critical-point
+#     analysis, no recommendation) and caches the result server-side under
+#     a dataset_id, so the map can show the real heatmap immediately after
+#     a place is resolved.
+#   /analyze -- runs the actual Morse analysis (+ optional recommendation).
+#     If given a still-valid dataset_id it reuses that cached raw data
+#     instead of re-fetching (avoiding a second round of live API calls,
+#     and Open-Meteo's per-minute rate limit); otherwise it fetches fresh,
+#     so it still works standalone (e.g. after editing bounds by hand).
 
-@app.route("/api/realworld/analyze", methods=["POST"])
-def realworld_analyze():
+_DATASET_CACHE_TTL_SECONDS = 15 * 60
+_dataset_cache: dict[str, tuple[float, object]] = {}
+
+
+def _cache_dataset(dataset) -> str:
+    now = time.time()
+    for key in [k for k, (ts, _) in _dataset_cache.items() if now - ts > _DATASET_CACHE_TTL_SECONDS]:
+        del _dataset_cache[key]
+    dataset_id = uuid.uuid4().hex
+    _dataset_cache[dataset_id] = (now, dataset)
+    return dataset_id
+
+
+def _get_cached_dataset(dataset_id: str):
+    entry = _dataset_cache.get(dataset_id)
+    if entry is None:
+        return None
+    ts, dataset = entry
+    if time.time() - ts > _DATASET_CACHE_TTL_SECONDS:
+        del _dataset_cache[dataset_id]
+        return None
+    return dataset
+
+
+def _parse_realworld_form():
+    """Shared bounds/resolution/topic/custom-layer parsing for both
+    /load_data and /analyze. Returns (bounds, resolution, primary_variable,
+    layer_sources, layer_descriptions, tmp_paths) or an (error, status)
+    tuple if the form was invalid."""
     bounds_raw = request.form.get("bounds", "")
     try:
         bounds = tuple(float(x) for x in bounds_raw.split(","))
         if len(bounds) != 4:
             raise ValueError
     except ValueError:
-        return jsonify({"error": "bounds must be 'lat_min,lat_max,lon_min,lon_max'"}), 400
+        return {"error": "bounds must be 'lat_min,lat_max,lon_min,lon_max'"}, 400
 
     try:
         resolution = int(request.form.get("resolution", 20))
     except ValueError:
-        return jsonify({"error": "resolution must be an integer"}), 400
-    resolution = max(6, min(resolution, 40))  # keep API/compute cost bounded
+        return {"error": "resolution must be an integer"}, 400
+    # The Morse engine itself is fast even at high resolution (100x100 is
+    # under half a second); the real cost is live HTTP fetch batches (100
+    # coordinates per request), which scale with resolution^2. 80 keeps a
+    # worst-case request in the tens-of-seconds range rather than minutes.
+    resolution = max(6, min(resolution, 80))
 
     primary_variable = request.form.get("primary_variable", "elevation")
     if primary_variable not in OPEN_METEO_VARIABLES:
-        return jsonify({"error": f"unknown topic '{primary_variable}'"}), 400
+        return {"error": f"unknown topic '{primary_variable}'"}, 400
 
     layer_sources: dict[str, str | None] = {primary_variable: None}
     layer_descriptions: dict[str, str] = {}
@@ -216,6 +260,16 @@ def realworld_analyze():
     if request.form.get("use_sample_layer") == "true":
         layer_sources["hazard_survey"] = str(APP_DIR / "examples" / "sample_hazard_layer.csv")
 
+    return bounds, resolution, primary_variable, layer_sources, layer_descriptions, tmp_paths
+
+
+@app.route("/api/realworld/load_data", methods=["POST"])
+def realworld_load_data():
+    parsed = _parse_realworld_form()
+    if isinstance(parsed[0], dict):  # error tuple
+        return jsonify(parsed[0]), parsed[1]
+    bounds, resolution, primary_variable, layer_sources, layer_descriptions, tmp_paths = parsed
+
     try:
         dataset = build_real_world_dataset(
             "web_request", bounds, layer_sources, resolution=resolution,
@@ -226,6 +280,46 @@ def realworld_analyze():
     finally:
         for p in tmp_paths:
             Path(p).unlink(missing_ok=True)
+
+    dataset_id = _cache_dataset(dataset)
+    layers = {name: {"field": field_to_geojson(field)} for name, field in dataset.scalar_fields.items()}
+
+    lat_min, lat_max, lon_min, lon_max = bounds
+    return jsonify({
+        "dataset_id": dataset_id,
+        "bounds": [[lat_min, lon_min], [lat_max, lon_max]],
+        "layers": layers,
+    })
+
+
+@app.route("/api/realworld/analyze", methods=["POST"])
+def realworld_analyze():
+    dataset_id = request.form.get("dataset_id", "").strip()
+    cached = _get_cached_dataset(dataset_id) if dataset_id else None
+
+    if cached is not None:
+        dataset = cached
+        bounds = dataset.bounds
+        primary_variable = request.form.get("primary_variable", "elevation")
+        layer_sources = dataset.layer_sources
+        layer_descriptions = dataset.layer_descriptions
+        tmp_paths = []
+    else:
+        parsed = _parse_realworld_form()
+        if isinstance(parsed[0], dict):
+            return jsonify(parsed[0]), parsed[1]
+        bounds, resolution, primary_variable, layer_sources, layer_descriptions, tmp_paths = parsed
+
+        try:
+            dataset = build_real_world_dataset(
+                "web_request", bounds, layer_sources, resolution=resolution,
+                layer_descriptions=layer_descriptions,
+            )
+        except Exception as exc:
+            return jsonify({"error": str(exc)}), 400
+        finally:
+            for p in tmp_paths:
+                Path(p).unlink(missing_ok=True)
 
     results = {name: analyze_scalar_field(field) for name, field in dataset.scalar_fields.items()}
 
@@ -244,6 +338,12 @@ def realworld_analyze():
                 context += (
                     "\nUser-supplied descriptions of other layers analyzed alongside this one "
                     f"(for context, not necessarily this result): {json.dumps(layer_descriptions, ensure_ascii=False)}"
+                )
+            feedback = request.form.get("feedback", "").strip()
+            if feedback:
+                context += "\n\n" + prompts.RERUN_CONTEXT_TEMPLATE.format(
+                    feedback=feedback,
+                    original_query=f"Analyze '{primary_variable}' over bounds {bounds}",
                 )
             recommendation = llm.chat(prompts.MORSE_RECOMMENDATION_SYSTEM, context)
         except Exception as exc:
