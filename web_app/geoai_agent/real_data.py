@@ -24,10 +24,10 @@ Two ways to get a layer's data onto the analysis grid:
 Elevation specifically has a second live source: USGS's 3DEP Elevation
 Point Query Service, genuine LiDAR-derived data (often truly ~1m
 resolution, vs. Open-Meteo's fixed ~90m SRTM) but US-only and queried one
-point at a time rather than batched, so it is only used automatically for
-small, explicitly high-resolution requests within the continental US (see
-fetch_usgs_elevation_field / should_prefer_usgs_elevation) -- not a
-blanket replacement for Open-Meteo, which stays the fast, global default.
+point at a time rather than batched. It is tried FIRST by default within
+the continental US (see build_real_world_dataset's elevation_source="auto"),
+falling back to Open-Meteo automatically if USGS fails or the location is
+outside its coverage -- see fetch_usgs_elevation_field.
 
 A "slope" layer (gradient magnitude of elevation) is derived for free from
 whatever elevation data is loaded, giving a second genuinely real layer
@@ -388,15 +388,6 @@ def is_in_continental_us(bounds: tuple[float, float, float, float]) -> bool:
     return us_lat_min <= mid_lat <= us_lat_max and us_lon_min <= mid_lon <= us_lon_max
 
 
-def should_prefer_usgs_elevation(bounds: tuple[float, float, float, float], wants_high_resolution: bool) -> bool:
-    """The actual source-selection rule: USGS's genuinely higher-precision
-    (often ~1m) LiDAR-derived elevation is only worth its much higher
-    per-point cost when the query explicitly wants high-resolution terrain
-    data AND the area is somewhere 3DEP actually covers -- otherwise
-    Open-Meteo (fast, global, batched) is the better default."""
-    return bool(wants_high_resolution) and is_in_continental_us(bounds)
-
-
 def fetch_usgs_elevation_field(
     bounds: tuple[float, float, float, float], resolution: int = GRID_RESOLUTION,
 ) -> ScalarField:
@@ -477,7 +468,7 @@ def build_real_world_dataset(
     resolution: int = GRID_RESOLUTION,
     include_slope: bool = True,
     layer_descriptions: dict[str, str] | None = None,
-    elevation_source: str = "open_meteo",
+    elevation_source: str = "auto",
 ) -> RealWorldDataset:
     """Builds a RealWorldDataset with one or more named layers.
 
@@ -492,15 +483,20 @@ def build_real_world_dataset(
     uploaded layers have no built-in meaning the way "elevation" does).
 
     elevation_source picks which live source an online-fetched "elevation"
-    layer comes from: "open_meteo" (fast, global, ~90m, the default) or
-    "usgs" (see fetch_usgs_elevation_field -- higher precision, US-only,
-    much slower; the caller decides when this is worth it via
-    should_prefer_usgs_elevation).
+    layer comes from:
+    - "auto" (the default): try USGS 3DEP first (see
+      fetch_usgs_elevation_field -- genuinely higher precision, often ~1m,
+      but US-only and much slower, one HTTP request per point), falling
+      back to Open-Meteo (fast, global, ~90m) if USGS fails or the
+      location has no 3DEP coverage.
+    - "usgs": USGS only, no fallback -- fails outright if USGS does.
+    - "open_meteo": Open-Meteo only, no fallback -- for when the higher
+      precision isn't worth the wait.
     """
     layer_sources = layer_sources or {"elevation": None}
     fields: dict[str, ScalarField] = {}
-    # may be upgraded to "usgs" below if Open-Meteo fails and a fallback
-    # succeeds -- kept in sync with what was ACTUALLY used, not just requested.
+    # may change below depending on what was actually reachable -- kept in
+    # sync with what was ACTUALLY used, not just requested.
     actual_elevation_source = elevation_source
 
     for layer_name, source in layer_sources.items():
@@ -508,21 +504,24 @@ def build_real_world_dataset(
             fields[layer_name] = scalar_field_from_upload(layer_name, source, bounds, resolution)
         elif layer_name == "elevation" and elevation_source == "usgs":
             fields[layer_name] = fetch_usgs_elevation_field(bounds, resolution)
+        elif layer_name == "elevation" and elevation_source == "open_meteo":
+            fields[layer_name] = fetch_open_meteo_field("elevation", bounds, resolution)
         elif layer_name == "elevation":
-            try:
-                fields[layer_name] = fetch_open_meteo_field("elevation", bounds, resolution)
-            except Exception as primary_exc:
-                # Open-Meteo can and does hit rate limits (per-minute, or a
-                # full daily quota) -- fall back to USGS 3DEP automatically
-                # rather than just failing, when it's actually usable here.
-                if not is_in_continental_us(bounds):
-                    raise
-                fallback_resolution = min(resolution, MAX_USGS_GRID_RESOLUTION)
+            # "auto" (default): USGS first, Open-Meteo as the fallback.
+            usgs_resolution = min(resolution, MAX_USGS_GRID_RESOLUTION)
+            if is_in_continental_us(bounds):
                 try:
-                    fields[layer_name] = fetch_usgs_elevation_field(bounds, fallback_resolution)
-                except Exception:
-                    raise primary_exc from None  # neither source worked; the Open-Meteo error is more informative
-                actual_elevation_source = "usgs"
+                    fields[layer_name] = fetch_usgs_elevation_field(bounds, usgs_resolution)
+                    actual_elevation_source = "usgs"
+                except Exception as primary_exc:
+                    try:
+                        fields[layer_name] = fetch_open_meteo_field("elevation", bounds, resolution)
+                    except Exception:
+                        raise primary_exc from None  # neither source worked; the USGS error is more informative
+                    actual_elevation_source = "open_meteo"
+            else:
+                fields[layer_name] = fetch_open_meteo_field("elevation", bounds, resolution)
+                actual_elevation_source = "open_meteo"
         elif layer_name in OPEN_METEO_VARIABLES:
             fields[layer_name] = fetch_open_meteo_field(layer_name, bounds, resolution)
         else:

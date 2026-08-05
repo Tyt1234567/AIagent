@@ -44,16 +44,14 @@ from geoai_agent.data import DOMAIN_BOUNDS, GeoDataset
 from geoai_agent.llm_client import LLMClient
 from geoai_agent.morse_topology import analyze_scalar_field
 from geoai_agent.real_data import (
-    MAX_GRID_RESOLUTION,
     MAX_USGS_GRID_RESOLUTION,
-    MIN_GRID_RESOLUTION,
     OPEN_METEO_VARIABLES,
     bounding_box_around_point,
     build_real_world_dataset,
     geocode_place,
     ground_spacing_meters,
+    is_in_continental_us,
     resolution_for_target_spacing,
-    should_prefer_usgs_elevation,
 )
 from geoai_agent.visualize import critical_points_to_geojson, field_to_geojson
 
@@ -230,19 +228,29 @@ def _parse_realworld_form():
     except ValueError:
         return {"error": "bounds must be 'lat_min,lat_max,lon_min,lon_max'"}, 400
 
+    # Resolution is specified as a physical ground distance (pixel size, in
+    # meters) rather than a raw grid point count -- resolution_for_target_
+    # spacing converts it to the point count needed to hit that spacing
+    # over this bounding box, already clamped to [MIN_GRID_RESOLUTION,
+    # MAX_GRID_RESOLUTION]. 500m is a reasonable default for a typical
+    # town-scale box.
     try:
-        resolution = int(request.form.get("resolution", 20))
+        resolution_meters = float(request.form.get("resolution_meters", 500))
     except ValueError:
-        return {"error": "resolution must be an integer"}, 400
-    resolution = max(MIN_GRID_RESOLUTION, min(resolution, MAX_GRID_RESOLUTION))
+        return {"error": "resolution_meters must be a number"}, 400
+    if resolution_meters <= 0:
+        return {"error": "resolution_meters must be positive"}, 400
+    resolution = resolution_for_target_spacing(bounds, resolution_meters)
 
     primary_variable = request.form.get("primary_variable", "elevation")
     if primary_variable not in OPEN_METEO_VARIABLES:
         return {"error": f"unknown topic '{primary_variable}'"}, 400
 
-    elevation_source = request.form.get("elevation_source", "open_meteo")
-    if elevation_source not in ("open_meteo", "usgs"):
-        elevation_source = "open_meteo"
+    # "auto" (the default): try USGS 3DEP first for elevation, falling back
+    # to Open-Meteo automatically -- see build_real_world_dataset.
+    elevation_source = request.form.get("elevation_source", "auto")
+    if elevation_source not in ("auto", "open_meteo", "usgs"):
+        elevation_source = "auto"
     if elevation_source == "usgs":
         resolution = min(resolution, MAX_USGS_GRID_RESOLUTION)
 
@@ -450,27 +458,21 @@ def realworld_smart_query():
         except (TypeError, ValueError):
             requested_meters = None
 
-    # Source selection: analyze what the query actually needs rather than
-    # always defaulting to Open-Meteo. USGS 3DEP gives genuinely
-    # higher-precision (often ~1m LiDAR-derived) elevation, but it's
-    # US-only and one HTTP request per point -- only worth it when the
-    # query explicitly wants high-resolution terrain data (see
-    # should_prefer_usgs_elevation), and the grid gets capped smaller
-    # since each point is far more expensive to fetch than via Open-Meteo.
-    elevation_source = "open_meteo"
+    # Source selection: for elevation, always try USGS 3DEP first
+    # (genuinely higher-precision, often ~1m LiDAR-derived), falling back
+    # to Open-Meteo automatically if USGS fails or the location has no
+    # 3DEP coverage -- see build_real_world_dataset's elevation_source="auto".
+    elevation_source = "auto" if variable == "elevation" else None
     source_note = None
-    if variable == "elevation" and should_prefer_usgs_elevation(bounds, extraction.get("wants_high_resolution_elevation")):
-        elevation_source = "usgs"
-        if resolution is None or resolution > MAX_USGS_GRID_RESOLUTION:
-            resolution = MAX_USGS_GRID_RESOLUTION
-        achieved_meters = ground_spacing_meters(bounds, resolution)
-        source_note = (
-            f"Using USGS 3DEP (genuinely LiDAR-derived elevation, often ~1m precision) instead of "
-            f"Open-Meteo, since this asks for high-resolution US terrain data. USGS has no batch "
-            f"endpoint -- one HTTP request per sample point -- so grid resolution is capped at "
-            f"{MAX_USGS_GRID_RESOLUTION} for this source (~{achieved_meters:.0f}m between sample "
-            "points) to keep the request from taking several minutes."
-        )
+    if variable == "elevation":
+        if is_in_continental_us(bounds):
+            source_note = (
+                "Elevation requests try USGS 3DEP first (genuinely LiDAR-derived, often ~1m "
+                "precision) -- USGS has no batch endpoint, so this can take up to a minute or "
+                "two, and automatically falls back to Open-Meteo if USGS is unavailable."
+            )
+        else:
+            source_note = "Using Open-Meteo (USGS 3DEP only covers the continental US)."
 
     lat_min, lat_max, lon_min, lon_max = bounds
     return jsonify({
