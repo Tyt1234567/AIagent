@@ -499,12 +499,30 @@ def build_real_world_dataset(
     """
     layer_sources = layer_sources or {"elevation": None}
     fields: dict[str, ScalarField] = {}
+    # may be upgraded to "usgs" below if Open-Meteo fails and a fallback
+    # succeeds -- kept in sync with what was ACTUALLY used, not just requested.
+    actual_elevation_source = elevation_source
 
     for layer_name, source in layer_sources.items():
         if source is not None:
             fields[layer_name] = scalar_field_from_upload(layer_name, source, bounds, resolution)
         elif layer_name == "elevation" and elevation_source == "usgs":
             fields[layer_name] = fetch_usgs_elevation_field(bounds, resolution)
+        elif layer_name == "elevation":
+            try:
+                fields[layer_name] = fetch_open_meteo_field("elevation", bounds, resolution)
+            except Exception as primary_exc:
+                # Open-Meteo can and does hit rate limits (per-minute, or a
+                # full daily quota) -- fall back to USGS 3DEP automatically
+                # rather than just failing, when it's actually usable here.
+                if not is_in_continental_us(bounds):
+                    raise
+                fallback_resolution = min(resolution, MAX_USGS_GRID_RESOLUTION)
+                try:
+                    fields[layer_name] = fetch_usgs_elevation_field(bounds, fallback_resolution)
+                except Exception:
+                    raise primary_exc from None  # neither source worked; the Open-Meteo error is more informative
+                actual_elevation_source = "usgs"
         elif layer_name in OPEN_METEO_VARIABLES:
             fields[layer_name] = fetch_open_meteo_field(layer_name, bounds, resolution)
         else:
@@ -518,5 +536,5 @@ def build_real_world_dataset(
 
     return RealWorldDataset(
         name=name, bounds=bounds, scalar_fields=fields, layer_descriptions=layer_descriptions,
-        layer_sources=layer_sources, elevation_source=elevation_source,
+        layer_sources=layer_sources, elevation_source=actual_elevation_source,
     )
