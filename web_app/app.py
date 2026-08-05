@@ -11,22 +11,23 @@ Two panels, each backed by JSON API endpoints:
   layers (multi-layer, geoai_agent.real_data), online elevation fetch, and
   a Leaflet map over a real OpenStreetMap basemap.
 
-Run with:
+This folder is self-contained: geoai_agent/ below is a standalone copy of
+the analysis package (not an import of anything outside web_app/), and
+examples/ holds its own sample data. Run with:
+    python app.py
+from inside web_app/, or:
     python web_app/app.py
-from the project root or from inside web_app/ -- both work, see the
-sys.path adjustment below.
+from the project root -- both work, since Python always puts the launched
+script's own directory on sys.path first.
 """
 
 from __future__ import annotations
 
 import json
-import sys
 import tempfile
 from pathlib import Path
 
-PROJECT_ROOT = Path(__file__).resolve().parent.parent
-if str(PROJECT_ROOT) not in sys.path:
-    sys.path.insert(0, str(PROJECT_ROOT))
+APP_DIR = Path(__file__).resolve().parent
 
 from flask import Flask, jsonify, render_template, request
 from shapely.geometry import mapping
@@ -181,7 +182,7 @@ def realworld_analyze():
             layer_sources[name] = tmp.name
 
     if request.form.get("use_sample_layer") == "true":
-        layer_sources["hazard_survey"] = str(PROJECT_ROOT / "examples" / "sample_hazard_layer.csv")
+        layer_sources["hazard_survey"] = str(APP_DIR / "examples" / "sample_hazard_layer.csv")
 
     try:
         dataset = build_real_world_dataset("web_request", bounds, layer_sources, resolution=resolution)

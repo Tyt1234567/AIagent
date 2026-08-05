@@ -1,18 +1,19 @@
 # GeoAI Agent -- Web UI
 
-A Flask + vanilla JS/Leaflet front end over the same `geoai_agent` package
-used by `main.py` and `real_world_example.py`. All the analysis code
-(routing, discrete Morse theory, real-world data, GeoJSON generation)
-already lives in `geoai_agent/`; this folder is purely the web layer on
-top of it -- no analysis logic is duplicated here.
+A Flask + vanilla JS/Leaflet front end over the GeoAI agent's analysis
+engine. This folder is self-contained: `geoai_agent/` below is a standalone
+copy of the routing/discrete-Morse-theory/real-world-data/GeoJSON package
+(not an import of anything outside `web_app/`), and `examples/` holds its
+own sample CSV layer. Nothing in this folder reaches outside it -- you can
+copy just `web_app/` elsewhere and it still runs.
 
 ## Run
 
-From the project root (or from inside `web_app/`, both work):
+From inside `web_app/` (or from the project root, both work):
 
 ```
 pip install -r requirements.txt
-python web_app/app.py
+python app.py
 ```
 
 Requires the same [Ollama](https://ollama.com) server as the rest of the
