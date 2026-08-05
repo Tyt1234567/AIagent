@@ -33,12 +33,19 @@ critical points, toggleable via the layer control. After a recommendation
 comes back you can type feedback and re-run (same human-in-the-loop
 re-run the CLI supports), or accept it.
 
-**Real-World Data** -- enter a real lat/lon bounding box (defaults to the
-Boulder, CO Flatirons) and it fetches genuine terrain elevation from the
-free Open-Meteo API, derives a `slope` layer for free, and lets you add
-any number of your own CSV layers (`x,y,value`, x=longitude/y=latitude) by
-name + file upload -- the multi-layer path from
-`geoai_agent/real_data.py`. Results render on a real OpenStreetMap
+**Real-World Data** -- one bounding box, one topic (elevation, temperature,
+precipitation, wind, humidity, or pressure -- live-fetched from Open-Meteo,
+never pre-downloaded), and any number of extra user-uploaded layers, all
+behind a single "Fetch & Analyze" button. Fill in the bounds/topic fields
+either by hand, or describe the query in plain English ("find critical
+points in Boulder, Colorado") and click "Parse query" -- an LLM extraction
+step (natural-language phrasing varies too much for regex to keep up with
+reliably) works out the place/coordinates and topic and fills the fields
+in for you; it never fetches anything itself. Add your own CSV
+(`x,y,value`) or shapefile (`.zip` bundling `.shp`/`.shx`/`.dbf`, POINT
+geometry + a `value` field) layers by name + file upload -- naming a
+custom layer the same as the selected topic (e.g. "elevation") overrides
+the live fetch with your own data. Results render on a real OpenStreetMap
 basemap with one heatmap + critical-points overlay per layer.
 
 ## API endpoints
@@ -48,16 +55,21 @@ basemap with one heatmap + critical-points overlay per layer.
 - `POST /api/town/query` -- `{"original_query": "...", "feedback": "..."}`
   (feedback optional) -> runs `GeoAIAgent.run_once`, returns the route,
   recommendation, and (for the morse route) field GeoJSON.
+- `POST /api/realworld/smart_query` -- `{"query": "..."}` -> an LLM
+  extraction call works out `{bounds, variable, resolved_place}` from free
+  text; returns what was understood without fetching anything. The
+  frontend fills the manual fields in from this response.
 - `POST /api/realworld/analyze` -- multipart form: `bounds`, `resolution`,
-  `use_sample_layer`, `recommend`, plus any number of
-  `layer_name` + `layer_file::<name>` pairs for custom CSV layers -> runs
-  `build_real_world_dataset` + `analyze_scalar_field` per layer, returns
-  GeoJSON + summaries (+ an LLM recommendation for elevation if
-  requested).
+  `primary_variable`, `use_sample_layer`, `recommend`, plus any number of
+  `layer_name` + `layer_file::<name>` (+ optional `layer_description::<name>`)
+  pairs for custom CSV/shapefile layers -> runs `build_real_world_dataset`
+  + `analyze_scalar_field` per layer, returns GeoJSON + summaries (+ an
+  LLM recommendation for `primary_variable` if requested). The single
+  fetch+analyze action for this panel.
 
 ## Notes
 
 - `app.run(debug=True)` is a development server -- fine for local use, not
   meant to be exposed to the internet as-is.
-- Uploaded CSV layers are written to a temp file for the duration of one
+- Uploaded layer files are written to a temp file for the duration of one
   request and deleted immediately after.

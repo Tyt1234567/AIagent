@@ -98,11 +98,6 @@ main {
   margin: 4px 0 10px;
 }
 
-#sq-elevation-source-row label {
-  font-weight: normal;
-  margin: 6px 0;
-}
-
 .sidebar input[type="text"],
 .sidebar input[type="number"],
 .sidebar textarea {

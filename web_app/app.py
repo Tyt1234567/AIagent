@@ -7,9 +7,13 @@ Two panels, each backed by JSON API endpoints:
   re-run loop and a map of the town's road network, zones, hazard zone,
   and population points -- overlaid with a scalar-field heatmap and
   critical points when the query routes to Morse analysis.
-- Real-World Data: a lat/lon bounding box, optional user-uploaded CSV
-  layers (multi-layer, geoai_agent.real_data), online elevation fetch, and
-  a Leaflet map over a real OpenStreetMap basemap.
+- Real-World Data: a lat/lon bounding box and topic (elevation, temperature,
+  precipitation, wind, humidity, pressure -- live-fetched, never
+  pre-downloaded), fillable either by hand or from a free-text query via
+  Smart Query's LLM-based understanding step, plus any number of
+  user-uploaded CSV/shapefile layers, all over a real OpenStreetMap
+  basemap. One bounds/topic state, one "Fetch & Analyze" action --
+  Smart Query only ever fills in the fields this endpoint reads.
 
 This folder is self-contained: geoai_agent/ below is a standalone copy of
 the analysis package (not an import of anything outside web_app/), and
@@ -164,7 +168,11 @@ def _layer_summary(result: dict) -> dict:
     }
 
 
-# -- Real-World Data (online elevation + user-supplied multi-layer CSVs) --
+# -- Real-World Data: one bounding box, one topic, any number of extra ---
+# user-supplied layers. The single entry point for actually fetching and
+# analyzing anything in this panel -- Smart Query (below) only ever fills
+# in the bounds/topic fields this endpoint reads, it never fetches on its
+# own, so there is exactly one bounds/topic state and one "run" action.
 
 @app.route("/api/realworld/analyze", methods=["POST"])
 def realworld_analyze():
@@ -182,7 +190,11 @@ def realworld_analyze():
         return jsonify({"error": "resolution must be an integer"}), 400
     resolution = max(6, min(resolution, 40))  # keep API/compute cost bounded
 
-    layer_sources: dict[str, str | None] = {"elevation": None}
+    primary_variable = request.form.get("primary_variable", "elevation")
+    if primary_variable not in OPEN_METEO_VARIABLES:
+        return jsonify({"error": f"unknown topic '{primary_variable}'"}), 400
+
+    layer_sources: dict[str, str | None] = {primary_variable: None}
     layer_descriptions: dict[str, str] = {}
     tmp_paths = []
     for name in request.form.getlist("layer_name"):
@@ -196,7 +208,7 @@ def realworld_analyze():
             file.save(tmp.name)
             tmp.close()
             tmp_paths.append(tmp.name)
-            layer_sources[name] = tmp.name
+            layer_sources[name] = tmp.name  # a layer named e.g. "elevation" overrides the live fetch above
         description = request.form.get(f"layer_description::{name}", "").strip()
         if description:
             layer_descriptions[name] = description
@@ -218,10 +230,16 @@ def realworld_analyze():
     results = {name: analyze_scalar_field(field) for name, field in dataset.scalar_fields.items()}
 
     recommendation = None
-    if request.form.get("recommend") == "true" and "elevation" in results:
+    if request.form.get("recommend") == "true" and primary_variable in results:
         try:
             llm = LLMClient()
-            context = f"Morse analysis result: {json.dumps(results['elevation'], ensure_ascii=False)}"
+            live_source = "a user-uploaded file" if layer_sources.get(primary_variable) else "the live Open-Meteo API (not pre-downloaded or cached)"
+            context = (
+                f"'{primary_variable}' data for this run came from {live_source}. Basins/peaks were "
+                "computed by persistence-guided steepest-descent/ascent watershed directly on the raw "
+                "field, with NO heuristic depression-filling or breaching preprocessing.\n"
+                f"Morse analysis result: {json.dumps(results[primary_variable], ensure_ascii=False)}"
+            )
             if layer_descriptions:
                 context += (
                     "\nUser-supplied descriptions of other layers analyzed alongside this one "
@@ -248,167 +266,64 @@ def realworld_analyze():
     })
 
 
-# -- Smart Query: free-text real-world queries, live-fetched, any topic --
+# -- Smart Query: understand a free-text query, don't fetch anything -----
 #
-# Two round trips, so the app can surface a decision to the user instead of
-# guessing (mirrors the CLI/agent's human-in-the-loop pattern):
-#   stage="parse" -- an LLM extraction call (prompts.
-#     REALWORLD_QUERY_EXTRACTION_SYSTEM) works out what place/coordinates
-#     and which live variable (elevation, temperature, precipitation, wind,
-#     humidity, pressure -- see geoai_agent.real_data.OPEN_METEO_VARIABLES)
-#     the query is about -- natural-language phrasing (prepositions,
-#     capitalization, trailing qualifier clauses like "with a resolution of
-#     30 meters") varies too much for a hand-written pattern to keep up
-#     with reliably. A named place is then live-geocoded to coordinates.
-#     Nothing is fetched yet; returns needs_input with what was understood
-#     so the user can confirm or correct it before anything runs.
-#   stage="run" -- the user-confirmed bounds/variable (and, for elevation,
-#     a choice between the free public DEM and their own uploaded CSV) are
-#     fetched live right now and analyzed. No data is ever pre-downloaded
-#     or cached between requests.
+# An LLM extraction call (prompts.REALWORLD_QUERY_EXTRACTION_SYSTEM) works
+# out what place/coordinates and which live variable (elevation,
+# temperature, precipitation, wind, humidity, pressure -- see
+# geoai_agent.real_data.OPEN_METEO_VARIABLES) a free-text query is about --
+# natural-language phrasing (prepositions, capitalization, trailing
+# qualifier clauses like "with a resolution of 30 meters") varies too much
+# for a hand-written pattern to keep up with reliably. A named place is
+# then live-geocoded to coordinates. This endpoint only ever returns what
+# was understood -- it never fetches scalar-field data itself. The actual
+# fetch+analyze is a single, separate action: /api/realworld/analyze,
+# which the frontend fills in from this response's bounds/variable rather
+# than triggering here, so there is exactly one bounds/topic state and one
+# "run" button in the UI.
 
 @app.route("/api/realworld/smart_query", methods=["POST"])
 def realworld_smart_query():
-    stage = request.form.get("stage", "parse")
     query = request.form.get("query", "").strip()
     if not query:
         return jsonify({"error": "query is required"}), 400
 
-    if stage == "parse":
-        try:
-            extraction = LLMClient().chat_json(prompts.REALWORLD_QUERY_EXTRACTION_SYSTEM, query)
-        except Exception as exc:
-            return jsonify({"error": f"query understanding failed: {exc}"}), 502
-
-        variable = extraction.get("variable")
-        if variable not in OPEN_METEO_VARIABLES:
-            variable = "elevation"
-
-        explicit_bounds = extraction.get("explicit_bounds")
-        resolved_place = None
-        if explicit_bounds and len(explicit_bounds) == 4:
-            bounds = tuple(float(x) for x in explicit_bounds)
-        else:
-            place_name = extraction.get("place_name")
-            geocoded = geocode_place(place_name) if place_name else None
-            if geocoded is None:
-                return jsonify({
-                    "error": (
-                        f"Couldn't find a real-world location in that text"
-                        f"{f' (understood it as \"{place_name}\")' if place_name else ''}. "
-                        "Try naming a place more explicitly (e.g. \"...in Boulder, Colorado\"), "
-                        "an explicit lat/lon box like '40.96N-41.15N, 75.15W-74.95W', "
-                        "or use the manual Bounds field above instead."
-                    )
-                }), 400
-            bounds = bounding_box_around_point(geocoded["latitude"], geocoded["longitude"])
-            resolved_place = geocoded
-
-        lat_min, lat_max, lon_min, lon_max = bounds
-        return jsonify({
-            "needs_input": True,
-            "bounds": [lat_min, lat_max, lon_min, lon_max],
-            "variable": variable,
-            "available_variables": list(OPEN_METEO_VARIABLES),
-            "needs_elevation_source_choice": variable == "elevation",
-            "query": query,
-            "resolved_place": resolved_place,
-        })
-
-    # stage == "run"
     try:
-        bounds = tuple(float(x) for x in request.form.get("bounds", "").split(","))
-        if len(bounds) != 4:
-            raise ValueError
-    except ValueError:
-        return jsonify({"error": "bounds must be 'lat_min,lat_max,lon_min,lon_max'"}), 400
+        extraction = LLMClient().chat_json(prompts.REALWORLD_QUERY_EXTRACTION_SYSTEM, query)
+    except Exception as exc:
+        return jsonify({"error": f"query understanding failed: {exc}"}), 502
 
-    variable = request.form.get("variable", "elevation")
+    variable = extraction.get("variable")
     if variable not in OPEN_METEO_VARIABLES:
-        return jsonify({"error": f"unknown variable '{variable}'"}), 400
+        variable = "elevation"
 
-    try:
-        resolution = int(request.form.get("resolution", 20))
-    except ValueError:
-        return jsonify({"error": "resolution must be an integer"}), 400
-    resolution = max(6, min(resolution, 40))
-
-    elevation_source = request.form.get("elevation_source", "open_meteo")
-    tmp_path = None
-    method_note = ""
-    if variable == "elevation" and elevation_source == "csv":
-        file = request.files.get("csv_file")
-        if not file or not file.filename:
-            return jsonify({"error": "elevation_source is 'csv' but no csv_file was uploaded"}), 400
-        tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".csv")
-        file.save(tmp.name)
-        tmp.close()
-        tmp_path = tmp.name
-        method_note = (
-            "Elevation for this run came from a user-uploaded DEM CSV, not the "
-            "public Open-Meteo API."
-        )
+    explicit_bounds = extraction.get("explicit_bounds")
+    resolved_place = None
+    if explicit_bounds and len(explicit_bounds) == 4:
+        bounds = tuple(float(x) for x in explicit_bounds)
     else:
-        method_note = (
-            f"'{variable}' for this run was fetched live from the free, keyless "
-            "Open-Meteo API at request time (no pre-downloaded or cached data)."
-            + (
-                " Open-Meteo's public elevation API is SRTM-derived at roughly "
-                "90m resolution, not true 1-meter LiDAR; note this resolution "
-                "caveat explicitly if the user asked about fine-grained terrain."
-                if variable == "elevation" else ""
-            )
-        )
-
-    try:
-        dataset = build_real_world_dataset(
-            "smart_query", bounds, {variable: tmp_path}, resolution=resolution,
-            include_slope=(variable == "elevation"),
-        )
-    except Exception as exc:
-        return jsonify({"error": str(exc)}), 400
-    finally:
-        if tmp_path:
-            Path(tmp_path).unlink(missing_ok=True)
-
-    results = {name: analyze_scalar_field(field) for name, field in dataset.scalar_fields.items()}
-
-    method_note += (
-        " Basins/peaks were computed by persistence-guided steepest-descent/ascent "
-        "watershed directly on the raw field, with NO heuristic depression-filling "
-        "or breaching preprocessing; persistence simplification (folding "
-        "low-persistence critical-point pairs into their neighbor) is what removes "
-        "micro-scale noise instead."
-    )
-
-    recommendation = None
-    try:
-        llm = LLMClient()
-        recommendation = llm.chat(
-            prompts.MORSE_RECOMMENDATION_SYSTEM,
-            f"Original user query: {query}\n"
-            f"Method note: {method_note}\n"
-            f"Morse analysis result: {json.dumps(results[variable], ensure_ascii=False)}",
-        )
-    except Exception as exc:
-        recommendation = f"(recommendation unavailable: {exc})"
-
-    layers = {}
-    for name, field in dataset.scalar_fields.items():
-        result = results[name]
-        layers[name] = {
-            "field": field_to_geojson(field),
-            "points": critical_points_to_geojson(result),
-            "summary": _layer_summary(result),
-        }
+        place_name = extraction.get("place_name")
+        geocoded = geocode_place(place_name) if place_name else None
+        if geocoded is None:
+            return jsonify({
+                "error": (
+                    f"Couldn't find a real-world location in that text"
+                    f"{f' (understood it as \"{place_name}\")' if place_name else ''}. "
+                    "Try naming a place more explicitly (e.g. \"...in Boulder, Colorado\"), "
+                    "an explicit lat/lon box like '40.96N-41.15N, 75.15W-74.95W', "
+                    "or use the manual Bounds field below instead."
+                )
+            }), 400
+        bounds = bounding_box_around_point(geocoded["latitude"], geocoded["longitude"])
+        resolved_place = geocoded
 
     lat_min, lat_max, lon_min, lon_max = bounds
     return jsonify({
-        "bounds": [[lat_min, lon_min], [lat_max, lon_max]],
-        "layers": layers,
-        "recommendation": recommendation,
+        "bounds": [lat_min, lat_max, lon_min, lon_max],
         "variable": variable,
-        "method_note": method_note,
+        "available_variables": list(OPEN_METEO_VARIABLES),
+        "query": query,
+        "resolved_place": resolved_place,
     })
 
 
