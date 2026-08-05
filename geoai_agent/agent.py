@@ -68,7 +68,7 @@ class GeoAIAgent:
         query = user_query
         extra_context = ""
         while True:
-            result = self._run_pipeline(query, extra_context)
+            result = self.run_once(query, extra_context)
 
             if result["route"] == "geometry":
                 # Geometry branch exits directly to Standard GIS Tools output,
@@ -91,13 +91,20 @@ class GeoAIAgent:
                 feedback=feedback, original_query=user_query
             )
 
+    def run_once(self, query: str, extra_context: str = "") -> dict:
+        """Runs the pipeline exactly once and returns the full result dict,
+        with no human-input loop. `run()` (the CLI entry point) wraps this in
+        the interactive feedback loop; non-interactive callers (e.g. the web
+        app in web_app/) should call this directly."""
+        return self._run_pipeline(query, extra_context)
+
     def _run_pipeline(self, query: str, extra_context: str = "") -> dict:
         task_spec = self._understand_task(query, extra_context)
         routing = self._spatial_reasoning_routing(query, task_spec, extra_context)
 
         if routing.get("geometry_sufficient"):
-            self._run_standard_gis_tool(routing)
-            return {"route": "geometry"}
+            tool_result = self._run_standard_gis_tool(routing)
+            return {"route": "geometry", "tool_result": tool_result}
 
         if routing.get("morse_needed"):
             return self._run_morse_analysis(routing, extra_context)
@@ -116,7 +123,7 @@ class GeoAIAgent:
         synthesis = self._spatial_reasoning_synthesis(public_integration, extra_context)
         recommendation = self._recommendation(synthesis, public_integration, extra_context)
 
-        return {"route": "topology", "recommendation": recommendation}
+        return {"route": "topology", "recommendation": recommendation, "integration": public_integration}
 
     # -- individual pipeline steps -----------------------------------
 
@@ -136,18 +143,19 @@ class GeoAIAgent:
         _log("2 Spatial Reasoning (routing)", routing)
         return routing
 
-    def _run_standard_gis_tool(self, routing: dict) -> None:
+    def _run_standard_gis_tool(self, routing: dict) -> dict:
         tool_name = routing.get("tool")
         params = routing.get("params", {})
         tool = STANDARD_GIS_TOOLS.get(tool_name)
         if tool is None:
-            _log("Standard GIS Tools", {"error": f"unknown tool '{tool_name}'"})
-            return
-        try:
-            result = tool(self.dataset, **params)
-        except TypeError as exc:
-            result = {"error": f"invalid arguments for '{tool_name}': {exc}", "params_received": params}
+            result = {"error": f"unknown tool '{tool_name}'"}
+        else:
+            try:
+                result = tool(self.dataset, **params)
+            except TypeError as exc:
+                result = {"error": f"invalid arguments for '{tool_name}': {exc}", "params_received": params}
         _log("Standard GIS Tools", result)
+        return result
 
     def _run_morse_analysis(self, routing: dict, extra_context: str) -> dict:
         field_name = routing.get("field", "elevation")
@@ -155,7 +163,7 @@ class GeoAIAgent:
         result = analyze_scalar_topology(self.dataset, field_name, persistence_threshold=threshold)
         _log("4 Morse Topology Analysis", result)
         recommendation = self._morse_recommendation(result, extra_context)
-        return {"route": "morse", "recommendation": recommendation}
+        return {"route": "morse", "recommendation": recommendation, "field": field_name, "morse_result": result}
 
     def _morse_recommendation(self, morse_result: dict, extra_context: str) -> str:
         user_prompt = f"Morse analysis result: {json.dumps(morse_result, ensure_ascii=False)}\n{extra_context}"

@@ -1,0 +1,229 @@
+"""
+Web UI for the GeoAI Agent: Flask backend + JS/Leaflet frontend.
+
+Two panels, each backed by JSON API endpoints:
+- Town Scenario: free-text natural-language queries against the synthetic
+  town (geoai_agent.agent.GeoAIAgent / GeoDataset), with a human-feedback
+  re-run loop and a map of the town's road network, zones, hazard zone,
+  and population points -- overlaid with a scalar-field heatmap and
+  critical points when the query routes to Morse analysis.
+- Real-World Data: a lat/lon bounding box, optional user-uploaded CSV
+  layers (multi-layer, geoai_agent.real_data), online elevation fetch, and
+  a Leaflet map over a real OpenStreetMap basemap.
+
+Run with:
+    python web_app/app.py
+from the project root or from inside web_app/ -- both work, see the
+sys.path adjustment below.
+"""
+
+from __future__ import annotations
+
+import json
+import sys
+import tempfile
+from pathlib import Path
+
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
+from flask import Flask, jsonify, render_template, request
+from shapely.geometry import mapping
+
+from geoai_agent import prompts
+from geoai_agent.agent import GeoAIAgent
+from geoai_agent.data import DOMAIN_BOUNDS, GeoDataset
+from geoai_agent.llm_client import LLMClient
+from geoai_agent.morse_topology import analyze_scalar_field
+from geoai_agent.real_data import build_real_world_dataset
+from geoai_agent.visualize import critical_points_to_geojson, field_to_geojson
+
+app = Flask(__name__)
+
+_agent: GeoAIAgent | None = None
+
+
+def get_agent() -> GeoAIAgent:
+    """Lazily builds one shared agent/dataset for the process -- the
+    synthetic town is static, so there is no need to rebuild it per request."""
+    global _agent
+    if _agent is None:
+        _agent = GeoAIAgent(llm_client=LLMClient(), dataset=GeoDataset())
+    return _agent
+
+
+@app.route("/")
+def index():
+    return render_template("index.html")
+
+
+# -- Town Scenario (synthetic dataset, full LLM-routed pipeline) --------
+
+@app.route("/api/town/base_map")
+def town_base_map():
+    dataset = get_agent().dataset
+
+    roads = [
+        {
+            "type": "Feature",
+            "properties": {
+                "u": u, "v": v,
+                "is_bridge_structure": data.get("is_bridge_structure", False),
+            },
+            "geometry": mapping(data["geom"]),
+        }
+        for u, v, data in dataset.road_graph.edges(data=True)
+    ]
+    zones = [
+        {"type": "Feature", "properties": {"name": name}, "geometry": mapping(poly)}
+        for name, poly in dataset.zones.items()
+    ]
+    population = [
+        {
+            "type": "Feature",
+            "properties": {"population": p.population, "nearest_node": p.nearest_node},
+            "geometry": mapping(p.point),
+        }
+        for p in dataset.population_points
+    ]
+
+    xmin, ymin, xmax, ymax = DOMAIN_BOUNDS
+    return jsonify({
+        "bounds": [[ymin, xmin], [ymax, xmax]],  # Leaflet [[y,x],[y,x]]
+        "roads": {"type": "FeatureCollection", "features": roads},
+        "zones": {"type": "FeatureCollection", "features": zones},
+        "hazard_zone": {"type": "Feature", "properties": {}, "geometry": mapping(dataset.hazard_zone)},
+        "population": {"type": "FeatureCollection", "features": population},
+        "available_fields": list(dataset.scalar_fields),
+    })
+
+
+@app.route("/api/town/query", methods=["POST"])
+def town_query():
+    payload = request.get_json(force=True) or {}
+    original_query = (payload.get("original_query") or payload.get("query") or "").strip()
+    feedback = (payload.get("feedback") or "").strip()
+
+    if not original_query:
+        return jsonify({"error": "query is required"}), 400
+
+    extra_context = ""
+    if feedback:
+        extra_context = prompts.RERUN_CONTEXT_TEMPLATE.format(
+            feedback=feedback, original_query=original_query
+        )
+
+    agent = get_agent()
+    try:
+        result = agent.run_once(original_query, extra_context)
+    except Exception as exc:  # LLM/backend failure -- surface it to the UI
+        return jsonify({"error": str(exc)}), 502
+
+    response = {
+        "route": result["route"],
+        "recommendation": result.get("recommendation"),
+        "original_query": original_query,
+    }
+
+    if result["route"] == "geometry":
+        response["tool_result"] = result.get("tool_result")
+    elif result["route"] == "topology":
+        response["integration"] = result.get("integration")
+    elif result["route"] == "morse":
+        field_name = result["field"]
+        morse_result = result["morse_result"]
+        field = agent.dataset.scalar_fields[field_name]
+        response["field"] = field_name
+        response["morse_summary"] = {
+            "value_range": morse_result["value_range"],
+            "persistence_threshold": morse_result["persistence_threshold"],
+            "num_significant_basins": morse_result["num_significant_basins"],
+        }
+        response["geojson"] = {
+            "field": field_to_geojson(field),
+            "points": critical_points_to_geojson(morse_result),
+        }
+
+    return jsonify(response)
+
+
+# -- Real-World Data (online elevation + user-supplied multi-layer CSVs) --
+
+@app.route("/api/realworld/analyze", methods=["POST"])
+def realworld_analyze():
+    bounds_raw = request.form.get("bounds", "")
+    try:
+        bounds = tuple(float(x) for x in bounds_raw.split(","))
+        if len(bounds) != 4:
+            raise ValueError
+    except ValueError:
+        return jsonify({"error": "bounds must be 'lat_min,lat_max,lon_min,lon_max'"}), 400
+
+    try:
+        resolution = int(request.form.get("resolution", 20))
+    except ValueError:
+        return jsonify({"error": "resolution must be an integer"}), 400
+    resolution = max(6, min(resolution, 40))  # keep API/compute cost bounded
+
+    layer_sources: dict[str, str | None] = {"elevation": None}
+    tmp_paths = []
+    for name in request.form.getlist("layer_name"):
+        name = name.strip()
+        if not name:
+            continue
+        file = request.files.get(f"layer_file::{name}")
+        if file and file.filename:
+            tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".csv")
+            file.save(tmp.name)
+            tmp.close()
+            tmp_paths.append(tmp.name)
+            layer_sources[name] = tmp.name
+
+    if request.form.get("use_sample_layer") == "true":
+        layer_sources["hazard_survey"] = str(PROJECT_ROOT / "examples" / "sample_hazard_layer.csv")
+
+    try:
+        dataset = build_real_world_dataset("web_request", bounds, layer_sources, resolution=resolution)
+    except Exception as exc:
+        return jsonify({"error": str(exc)}), 400
+    finally:
+        for p in tmp_paths:
+            Path(p).unlink(missing_ok=True)
+
+    results = {name: analyze_scalar_field(field) for name, field in dataset.scalar_fields.items()}
+
+    recommendation = None
+    if request.form.get("recommend") == "true" and "elevation" in results:
+        try:
+            llm = LLMClient()
+            recommendation = llm.chat(
+                prompts.MORSE_RECOMMENDATION_SYSTEM,
+                f"Morse analysis result: {json.dumps(results['elevation'], ensure_ascii=False)}",
+            )
+        except Exception as exc:
+            recommendation = f"(recommendation unavailable: {exc})"
+
+    layers = {}
+    for name, field in dataset.scalar_fields.items():
+        result = results[name]
+        layers[name] = {
+            "field": field_to_geojson(field),
+            "points": critical_points_to_geojson(result),
+            "summary": {
+                "value_range": result["value_range"],
+                "persistence_threshold": result["persistence_threshold"],
+                "num_significant_basins": result["num_significant_basins"],
+            },
+        }
+
+    lat_min, lat_max, lon_min, lon_max = bounds
+    return jsonify({
+        "bounds": [[lat_min, lon_min], [lat_max, lon_max]],
+        "layers": layers,
+        "recommendation": recommendation,
+    })
+
+
+if __name__ == "__main__":
+    app.run(debug=True, port=5000)
