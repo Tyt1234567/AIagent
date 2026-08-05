@@ -2,3 +2,4 @@ openai
 shapely
 networkx
 numpy
+flask

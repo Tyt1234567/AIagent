@@ -1,0 +1,94 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>GeoAI Agent</title>
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+<link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+</head>
+<body>
+
+<header>
+  <h1>GeoAI Agent</h1>
+  <nav>
+    <button class="tab-btn active" data-tab="town">Town Scenario</button>
+    <button class="tab-btn" data-tab="realworld">Real-World Data</button>
+  </nav>
+</header>
+
+<main>
+
+  <section id="tab-town" class="tab-panel active">
+    <div class="sidebar">
+      <h2>Ask a spatial question</h2>
+      <p class="hint">Routes to geometry tools, network topology, or discrete-Morse
+        scalar-field analysis over the synthetic town, depending on the question.</p>
+      <textarea id="town-query" rows="3" placeholder="e.g. Where would floodwater actually pool in this town, and how significant are those low points compared to noise?"></textarea>
+      <button id="town-submit">Ask</button>
+
+      <div id="town-examples" class="examples">
+        <span class="hint">Examples:</span>
+        <ul>
+          <li data-example="Which bridge should we reinforce first, considering flood risk and the population that depends on it to reach the hospital?">Which bridge should we reinforce first?</li>
+          <li data-example="What is the area of zone_cluster_a?">What is the area of zone_cluster_a?</li>
+          <li data-example="Where would floodwater actually pool in this town, and how significant are those low points compared to noise?">Where would floodwater pool?</li>
+          <li data-example="Where are the population density peaks, and what's the natural boundary between the two residential clusters?">Where are the population density peaks?</li>
+        </ul>
+      </div>
+
+      <div id="town-result" class="result-box" hidden>
+        <h3 id="town-route-label"></h3>
+        <pre id="town-recommendation"></pre>
+        <div id="town-feedback-box">
+          <label for="town-feedback">Feedback (optional) -- re-runs the pipeline with this folded in:</label>
+          <textarea id="town-feedback" rows="2" placeholder="e.g. ignore flood risk, focus on accessibility only"></textarea>
+          <div class="button-row">
+            <button id="town-accept">Accept</button>
+            <button id="town-rerun">Re-run with feedback</button>
+          </div>
+        </div>
+      </div>
+      <div id="town-status" class="status"></div>
+    </div>
+    <div id="town-map" class="map"></div>
+  </section>
+
+  <section id="tab-realworld" class="tab-panel">
+    <div class="sidebar">
+      <h2>Analyze a real place</h2>
+      <label for="rw-bounds">Bounding box (lat_min,lat_max,lon_min,lon_max)</label>
+      <input id="rw-bounds" type="text" value="39.95,40.05,-105.35,-105.25">
+      <p class="hint">Default: Boulder, CO Flatirons foothills. Elevation is always fetched
+        live from Open-Meteo; a "slope" layer is derived from it automatically.</p>
+
+      <label for="rw-resolution">Grid resolution</label>
+      <input id="rw-resolution" type="number" value="20" min="6" max="40">
+
+      <label><input id="rw-sample" type="checkbox"> Include bundled sample layer (hazard_survey)</label>
+
+      <div id="rw-custom-layers"></div>
+      <button id="rw-add-layer" type="button">+ Add custom CSV layer</button>
+
+      <label><input id="rw-recommend" type="checkbox" checked> Generate LLM recommendation (elevation)</label>
+
+      <button id="rw-submit">Fetch &amp; Analyze</button>
+
+      <div id="rw-status" class="status"></div>
+
+      <div id="rw-result" class="result-box" hidden>
+        <h3>Layers</h3>
+        <div id="rw-layer-summaries"></div>
+        <h3>Recommendation</h3>
+        <pre id="rw-recommendation"></pre>
+      </div>
+    </div>
+    <div id="realworld-map" class="map"></div>
+  </section>
+
+</main>
+
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<script src="{{ url_for('static', filename='main.js') }}"></script>
+</body>
+</html>
