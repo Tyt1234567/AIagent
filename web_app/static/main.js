@@ -252,12 +252,14 @@ document.getElementById("rw-add-layer").addEventListener("click", () => {
 async function submitRealworldAnalyze() {
   const bounds = document.getElementById("rw-bounds").value.trim();
   const resolution = document.getElementById("rw-resolution").value;
+  const variable = document.getElementById("rw-variable").value;
   const useSample = document.getElementById("rw-sample").checked;
   const recommend = document.getElementById("rw-recommend").checked;
 
   const formData = new FormData();
   formData.append("bounds", bounds);
   formData.append("resolution", resolution);
+  formData.append("primary_variable", variable);
   formData.append("use_sample_layer", useSample ? "true" : "false");
   formData.append("recommend", recommend ? "true" : "false");
 
@@ -329,9 +331,14 @@ function renderRealworldResult(data) {
 
 document.getElementById("rw-submit").addEventListener("click", submitRealworldAnalyze);
 
-// -- Smart Query (free-text, any topic, live-fetched) ------------------------
-
-let sqParsed = null; // {bounds, variable, query} from the last successful parse
+// -- Smart Query parsing (free-text -> fills in the fields above) -----------
+//
+// Parsing only ever fills in rw-bounds/rw-variable below and previews the
+// area on the map -- it never fetches data itself. There is exactly one
+// "Fetch & Analyze" button (submitRealworldAnalyze, above) and exactly one
+// bounds/topic state (the rw-* fields), so there is no way to click a
+// "run" action against a stale or different location than what was just
+// parsed.
 
 async function submitSmartQueryParse() {
   const query = document.getElementById("sq-query").value.trim();
@@ -343,14 +350,12 @@ async function submitSmartQueryParse() {
   setStatus("sq-status", "Parsing bounding box and topic...");
 
   const formData = new FormData();
-  formData.append("stage", "parse");
   formData.append("query", query);
 
   try {
     const res = await fetch("/api/realworld/smart_query", { method: "POST", body: formData });
     const data = await res.json();
     if (!res.ok) throw new Error(data.error || "request failed");
-    sqParsed = data;
     renderSmartQueryClarify(data);
     setStatus("sq-status", "");
   } catch (err) {
@@ -363,8 +368,7 @@ function renderSmartQueryClarify(data) {
   const place = data.resolved_place;
   const placeLine = place
     ? `<br><b>Resolved place:</b> ${place.name}, ${place.admin1 || ""} ${place.country || ""} ` +
-      `(${place.latitude.toFixed(4)}, ${place.longitude.toFixed(4)}) -- a small box was drawn around ` +
-      `this point; edit the manual Bounds field below and re-parse if it's the wrong "${place.name}".`
+      `(${place.latitude.toFixed(4)}, ${place.longitude.toFixed(4)})`
     : "";
 
   previewBounds(
@@ -372,79 +376,19 @@ function renderSmartQueryClarify(data) {
     place ? `${place.name}${place.admin1 ? ", " + place.admin1 : ""}` : "Bounding box to analyze"
   );
 
+  document.getElementById("rw-bounds").value =
+    [latMin, latMax, lonMin, lonMax].map((v) => v.toFixed(5)).join(",");
+  document.getElementById("rw-variable").value = data.variable;
+
   document.getElementById("sq-clarify-summary").innerHTML =
     `<b>Bounding box:</b> ${latMin.toFixed(3)}, ${latMax.toFixed(3)}, ${lonMin.toFixed(3)}, ${lonMax.toFixed(3)}` +
     placeLine +
-    `<br><b>Inferred topic:</b> ${data.variable} -- change it below if that's wrong.`;
-
-  const select = document.getElementById("sq-variable");
-  select.innerHTML = "";
-  data.available_variables.forEach((v) => {
-    const opt = document.createElement("option");
-    opt.value = v;
-    opt.textContent = v;
-    if (v === data.variable) opt.selected = true;
-    select.appendChild(opt);
-  });
-
-  const toggleElevationRow = () => {
-    document.getElementById("sq-elevation-source-row").hidden = select.value !== "elevation";
-  };
-  select.onchange = toggleElevationRow;
-  toggleElevationRow();
-
+    `<br><b>Topic:</b> ${data.variable}` +
+    `<br>Filled in below -- review and click "Fetch &amp; Analyze" when ready.`;
   document.getElementById("sq-clarify").hidden = false;
 }
 
-document.querySelectorAll('input[name="sq-elev-source"]').forEach((radio) => {
-  radio.addEventListener("change", () => {
-    document.getElementById("sq-csv-file").hidden =
-      document.querySelector('input[name="sq-elev-source"]:checked').value !== "csv";
-  });
-});
-
-async function submitSmartQueryRun() {
-  if (!sqParsed) return;
-  const variable = document.getElementById("sq-variable").value;
-  const resolution = document.getElementById("sq-resolution").value;
-  const elevSource = document.querySelector('input[name="sq-elev-source"]:checked')?.value || "open_meteo";
-
-  const formData = new FormData();
-  formData.append("stage", "run");
-  formData.append("query", sqParsed.query);
-  formData.append("bounds", sqParsed.bounds.join(","));
-  formData.append("variable", variable);
-  formData.append("resolution", resolution);
-  if (variable === "elevation") {
-    formData.append("elevation_source", elevSource);
-    if (elevSource === "csv") {
-      const file = document.getElementById("sq-csv-file").files[0];
-      if (!file) {
-        setStatus("sq-status", "Choose a CSV file first.", true);
-        return;
-      }
-      formData.append("csv_file", file);
-    }
-  }
-
-  setStatus("sq-status", `Fetching '${variable}' live and running Morse analysis...`);
-  try {
-    const res = await fetch("/api/realworld/smart_query", { method: "POST", body: formData });
-    const data = await res.json();
-    if (!res.ok) throw new Error(data.error || "request failed");
-    renderRealworldResult(data);
-    if (data.method_note) {
-      document.getElementById("rw-recommendation").textContent =
-        (data.recommendation || "") + "\n\n[Method note: " + data.method_note + "]";
-    }
-    setStatus("sq-status", "");
-  } catch (err) {
-    setStatus("sq-status", "Error: " + err.message, true);
-  }
-}
-
 document.getElementById("sq-parse").addEventListener("click", submitSmartQueryParse);
-document.getElementById("sq-run").addEventListener("click", submitSmartQueryRun);
 
 // -- init ---------------------------------------------------------------
 
