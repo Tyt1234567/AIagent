@@ -186,6 +186,7 @@ def realworld_analyze():
     resolution = max(6, min(resolution, 40))  # keep API/compute cost bounded
 
     layer_sources: dict[str, str | None] = {"elevation": None}
+    layer_descriptions: dict[str, str] = {}
     tmp_paths = []
     for name in request.form.getlist("layer_name"):
         name = name.strip()
@@ -193,17 +194,24 @@ def realworld_analyze():
             continue
         file = request.files.get(f"layer_file::{name}")
         if file and file.filename:
-            tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".csv")
+            suffix = Path(file.filename).suffix.lower() or ".csv"
+            tmp = tempfile.NamedTemporaryFile(delete=False, suffix=suffix)
             file.save(tmp.name)
             tmp.close()
             tmp_paths.append(tmp.name)
             layer_sources[name] = tmp.name
+        description = request.form.get(f"layer_description::{name}", "").strip()
+        if description:
+            layer_descriptions[name] = description
 
     if request.form.get("use_sample_layer") == "true":
         layer_sources["hazard_survey"] = str(APP_DIR / "examples" / "sample_hazard_layer.csv")
 
     try:
-        dataset = build_real_world_dataset("web_request", bounds, layer_sources, resolution=resolution)
+        dataset = build_real_world_dataset(
+            "web_request", bounds, layer_sources, resolution=resolution,
+            layer_descriptions=layer_descriptions,
+        )
     except Exception as exc:
         return jsonify({"error": str(exc)}), 400
     finally:
@@ -216,10 +224,13 @@ def realworld_analyze():
     if request.form.get("recommend") == "true" and "elevation" in results:
         try:
             llm = LLMClient()
-            recommendation = llm.chat(
-                prompts.MORSE_RECOMMENDATION_SYSTEM,
-                f"Morse analysis result: {json.dumps(results['elevation'], ensure_ascii=False)}",
-            )
+            context = f"Morse analysis result: {json.dumps(results['elevation'], ensure_ascii=False)}"
+            if layer_descriptions:
+                context += (
+                    "\nUser-supplied descriptions of other layers analyzed alongside this one "
+                    f"(for context, not necessarily this result): {json.dumps(layer_descriptions, ensure_ascii=False)}"
+                )
+            recommendation = llm.chat(prompts.MORSE_RECOMMENDATION_SYSTEM, context)
         except Exception as exc:
             recommendation = f"(recommendation unavailable: {exc})"
 

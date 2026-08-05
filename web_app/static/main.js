@@ -226,7 +226,8 @@ document.getElementById("rw-add-layer").addEventListener("click", () => {
   row.className = "custom-layer-row";
   row.innerHTML = `
     <input type="text" placeholder="layer name" class="rw-layer-name">
-    <input type="file" accept=".csv" class="rw-layer-file">
+    <input type="file" accept=".csv,.zip,.shp" class="rw-layer-file">
+    <input type="text" placeholder="what does this measure? (optional, helps the recommendation)" class="rw-layer-description">
     <button type="button" class="secondary rw-remove-layer">x</button>
   `;
   row.querySelector(".rw-remove-layer").addEventListener("click", () => row.remove());
@@ -248,9 +249,11 @@ async function submitRealworldAnalyze() {
   document.querySelectorAll(".custom-layer-row").forEach((row) => {
     const name = row.querySelector(".rw-layer-name").value.trim();
     const file = row.querySelector(".rw-layer-file").files[0];
+    const description = row.querySelector(".rw-layer-description").value.trim();
     if (name && file) {
       formData.append("layer_name", name);
       formData.append(`layer_file::${name}`, file);
+      if (description) formData.append(`layer_description::${name}`, description);
     }
   });
 

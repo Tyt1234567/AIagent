@@ -94,8 +94,12 @@
 
       <label><input id="rw-sample" type="checkbox"> Include bundled sample layer (hazard_survey)</label>
 
+      <p class="hint">Add your own data as an extra layer: a CSV (header
+        <code>x,y,value</code>) or an ESRI shapefile (a .zip bundling .shp/.shx/.dbf,
+        with a POINT geometry and a "value" attribute field). Describe what it measures
+        so the recommendation can interpret it correctly.</p>
       <div id="rw-custom-layers"></div>
-      <button id="rw-add-layer" type="button">+ Add custom CSV layer</button>
+      <button id="rw-add-layer" type="button">+ Add custom layer (CSV or shapefile)</button>
 
       <label><input id="rw-recommend" type="checkbox" checked> Generate LLM recommendation (elevation)</label>
 
