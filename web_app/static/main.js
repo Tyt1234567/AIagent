@@ -202,6 +202,7 @@ let realworldMap;
 let realworldTileLayer;
 let realworldLayerControl;
 const realworldOverlays = {};
+let sqPreviewRect = null; // outline of the bounding box shown right after parsing, before analysis runs
 
 function initRealworldMap() {
   realworldMap = L.map("realworld-map");
@@ -217,6 +218,20 @@ function clearRealworldOverlays() {
   for (const key in realworldOverlays) delete realworldOverlays[key];
   if (realworldLayerControl) realworldMap.removeControl(realworldLayerControl);
   realworldLayerControl = null;
+}
+
+// Switches the map to the resolved location as soon as it's known (right
+// after Parse, before the user even clicks "Fetch live & analyze"), so
+// they can see where the analysis will run and back out if it's wrong.
+function previewBounds(bounds, popupText) {
+  const [latMin, latMax, lonMin, lonMax] = bounds;
+  const leafletBounds = [[latMin, lonMin], [latMax, lonMax]];
+  if (sqPreviewRect) realworldMap.removeLayer(sqPreviewRect);
+  sqPreviewRect = L.rectangle(leafletBounds, {
+    color: "#2b6cb0", weight: 2, fillOpacity: 0.08, dashArray: "6",
+  }).addTo(realworldMap);
+  if (popupText) sqPreviewRect.bindPopup(popupText).openPopup();
+  realworldMap.fitBounds(leafletBounds, { maxZoom: 13 });
 }
 
 let customLayerCount = 0;
@@ -273,6 +288,10 @@ async function submitRealworldAnalyze() {
 function renderRealworldResult(data) {
   realworldMap.fitBounds(data.bounds);
   clearRealworldOverlays();
+  if (sqPreviewRect) {
+    realworldMap.removeLayer(sqPreviewRect);
+    sqPreviewRect = null;
+  }
 
   const summaryContainer = document.getElementById("rw-layer-summaries");
   summaryContainer.innerHTML = "";
@@ -347,6 +366,12 @@ function renderSmartQueryClarify(data) {
       `(${place.latitude.toFixed(4)}, ${place.longitude.toFixed(4)}) -- a small box was drawn around ` +
       `this point; edit the manual Bounds field below and re-parse if it's the wrong "${place.name}".`
     : "";
+
+  previewBounds(
+    data.bounds,
+    place ? `${place.name}${place.admin1 ? ", " + place.admin1 : ""}` : "Bounding box to analyze"
+  );
+
   document.getElementById("sq-clarify-summary").innerHTML =
     `<b>Bounding box:</b> ${latMin.toFixed(3)}, ${latMax.toFixed(3)}, ${lonMin.toFixed(3)}, ${lonMax.toFixed(3)}` +
     placeLine +
