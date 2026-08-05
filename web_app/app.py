@@ -45,6 +45,7 @@ from geoai_agent.llm_client import LLMClient
 from geoai_agent.morse_topology import analyze_scalar_field
 from geoai_agent.real_data import (
     MAX_GRID_RESOLUTION,
+    MAX_USGS_GRID_RESOLUTION,
     MIN_GRID_RESOLUTION,
     OPEN_METEO_VARIABLES,
     bounding_box_around_point,
@@ -52,6 +53,7 @@ from geoai_agent.real_data import (
     geocode_place,
     ground_spacing_meters,
     resolution_for_target_spacing,
+    should_prefer_usgs_elevation,
 )
 from geoai_agent.visualize import critical_points_to_geojson, field_to_geojson
 
@@ -218,8 +220,8 @@ def _get_cached_dataset(dataset_id: str):
 def _parse_realworld_form():
     """Shared bounds/resolution/topic/custom-layer parsing for both
     /load_data and /analyze. Returns (bounds, resolution, primary_variable,
-    layer_sources, layer_descriptions, tmp_paths) or an (error, status)
-    tuple if the form was invalid."""
+    layer_sources, layer_descriptions, tmp_paths, elevation_source) or an
+    (error, status) tuple if the form was invalid."""
     bounds_raw = request.form.get("bounds", "")
     try:
         bounds = tuple(float(x) for x in bounds_raw.split(","))
@@ -237,6 +239,12 @@ def _parse_realworld_form():
     primary_variable = request.form.get("primary_variable", "elevation")
     if primary_variable not in OPEN_METEO_VARIABLES:
         return {"error": f"unknown topic '{primary_variable}'"}, 400
+
+    elevation_source = request.form.get("elevation_source", "open_meteo")
+    if elevation_source not in ("open_meteo", "usgs"):
+        elevation_source = "open_meteo"
+    if elevation_source == "usgs":
+        resolution = min(resolution, MAX_USGS_GRID_RESOLUTION)
 
     layer_sources: dict[str, str | None] = {primary_variable: None}
     layer_descriptions: dict[str, str] = {}
@@ -260,7 +268,7 @@ def _parse_realworld_form():
     if request.form.get("use_sample_layer") == "true":
         layer_sources["hazard_survey"] = str(APP_DIR / "examples" / "sample_hazard_layer.csv")
 
-    return bounds, resolution, primary_variable, layer_sources, layer_descriptions, tmp_paths
+    return bounds, resolution, primary_variable, layer_sources, layer_descriptions, tmp_paths, elevation_source
 
 
 @app.route("/api/realworld/load_data", methods=["POST"])
@@ -268,12 +276,12 @@ def realworld_load_data():
     parsed = _parse_realworld_form()
     if isinstance(parsed[0], dict):  # error tuple
         return jsonify(parsed[0]), parsed[1]
-    bounds, resolution, primary_variable, layer_sources, layer_descriptions, tmp_paths = parsed
+    bounds, resolution, primary_variable, layer_sources, layer_descriptions, tmp_paths, elevation_source = parsed
 
     try:
         dataset = build_real_world_dataset(
             "web_request", bounds, layer_sources, resolution=resolution,
-            layer_descriptions=layer_descriptions,
+            layer_descriptions=layer_descriptions, elevation_source=elevation_source,
         )
     except Exception as exc:
         return jsonify({"error": str(exc)}), 400
@@ -303,17 +311,18 @@ def realworld_analyze():
         primary_variable = request.form.get("primary_variable", "elevation")
         layer_sources = dataset.layer_sources
         layer_descriptions = dataset.layer_descriptions
+        elevation_source = dataset.elevation_source
         tmp_paths = []
     else:
         parsed = _parse_realworld_form()
         if isinstance(parsed[0], dict):
             return jsonify(parsed[0]), parsed[1]
-        bounds, resolution, primary_variable, layer_sources, layer_descriptions, tmp_paths = parsed
+        bounds, resolution, primary_variable, layer_sources, layer_descriptions, tmp_paths, elevation_source = parsed
 
         try:
             dataset = build_real_world_dataset(
                 "web_request", bounds, layer_sources, resolution=resolution,
-                layer_descriptions=layer_descriptions,
+                layer_descriptions=layer_descriptions, elevation_source=elevation_source,
             )
         except Exception as exc:
             return jsonify({"error": str(exc)}), 400
@@ -327,7 +336,12 @@ def realworld_analyze():
     if request.form.get("recommend") == "true" and primary_variable in results:
         try:
             llm = LLMClient()
-            live_source = "a user-uploaded file" if layer_sources.get(primary_variable) else "the live Open-Meteo API (not pre-downloaded or cached)"
+            if layer_sources.get(primary_variable):
+                live_source = "a user-uploaded file"
+            elif primary_variable == "elevation" and elevation_source == "usgs":
+                live_source = "USGS's 3DEP Elevation Point Query Service (genuinely LiDAR-derived, not pre-downloaded or cached)"
+            else:
+                live_source = "the live Open-Meteo API (not pre-downloaded or cached)"
             context = (
                 f"'{primary_variable}' data for this run came from {live_source}. Basins/peaks were "
                 "computed by persistence-guided steepest-descent/ascent watershed directly on the raw "
@@ -428,6 +442,28 @@ def realworld_smart_query():
         except (TypeError, ValueError):
             requested_meters = None
 
+    # Source selection: analyze what the query actually needs rather than
+    # always defaulting to Open-Meteo. USGS 3DEP gives genuinely
+    # higher-precision (often ~1m LiDAR-derived) elevation, but it's
+    # US-only and one HTTP request per point -- only worth it when the
+    # query explicitly wants high-resolution terrain data (see
+    # should_prefer_usgs_elevation), and the grid gets capped smaller
+    # since each point is far more expensive to fetch than via Open-Meteo.
+    elevation_source = "open_meteo"
+    source_note = None
+    if variable == "elevation" and should_prefer_usgs_elevation(bounds, extraction.get("wants_high_resolution_elevation")):
+        elevation_source = "usgs"
+        if resolution is None or resolution > MAX_USGS_GRID_RESOLUTION:
+            resolution = MAX_USGS_GRID_RESOLUTION
+        achieved_meters = ground_spacing_meters(bounds, resolution)
+        source_note = (
+            f"Using USGS 3DEP (genuinely LiDAR-derived elevation, often ~1m precision) instead of "
+            f"Open-Meteo, since this asks for high-resolution US terrain data. USGS has no batch "
+            f"endpoint -- one HTTP request per sample point -- so grid resolution is capped at "
+            f"{MAX_USGS_GRID_RESOLUTION} for this source (~{achieved_meters:.0f}m between sample "
+            "points) to keep the request from taking several minutes."
+        )
+
     lat_min, lat_max, lon_min, lon_max = bounds
     return jsonify({
         "bounds": [lat_min, lat_max, lon_min, lon_max],
@@ -438,6 +474,8 @@ def realworld_smart_query():
         "resolution": resolution,
         "requested_resolution_meters": requested_meters,
         "achieved_resolution_meters": achieved_meters,
+        "elevation_source": elevation_source,
+        "source_note": source_note,
     })
 
 

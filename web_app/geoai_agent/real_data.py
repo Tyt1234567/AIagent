@@ -21,6 +21,14 @@ Two ways to get a layer's data onto the analysis grid:
   query is actually about (see prompts.REALWORLD_QUERY_EXTRACTION_SYSTEM
   for how a query is mapped onto one of these).
 
+Elevation specifically has a second live source: USGS's 3DEP Elevation
+Point Query Service, genuine LiDAR-derived data (often truly ~1m
+resolution, vs. Open-Meteo's fixed ~90m SRTM) but US-only and queried one
+point at a time rather than batched, so it is only used automatically for
+small, explicitly high-resolution requests within the continental US (see
+fetch_usgs_elevation_field / should_prefer_usgs_elevation) -- not a
+blanket replacement for Open-Meteo, which stays the fast, global default.
+
 A "slope" layer (gradient magnitude of elevation) is derived for free from
 whatever elevation data is loaded, giving a second genuinely real layer
 even when the user supplies nothing else -- a concrete demonstration of
@@ -36,6 +44,7 @@ import re
 import urllib.error
 import urllib.request
 import urllib.parse
+from concurrent.futures import ThreadPoolExecutor
 
 import numpy as np
 
@@ -51,6 +60,20 @@ MIN_GRID_RESOLUTION = 6
 MAX_GRID_RESOLUTION = 80
 _FETCH_BATCH = 100  # conservative shared batch size, verified against the elevation endpoint's limit
 _METERS_PER_DEGREE_LAT = 111_320
+
+# USGS EPQS is queried one point at a time (no batch endpoint). Measured
+# live at ~0.8s/point even with 10-way concurrency (52s for 64 points),
+# with a real error rate under load (~11% in testing) -- so it is only
+# used for small grids. 10x10=100 points is roughly 80s in the worst case,
+# the practical ceiling for a single synchronous web request without a
+# progress indicator.
+MAX_USGS_GRID_RESOLUTION = 10
+_USGS_CONCURRENCY = 10
+_USGS_MAX_RETRIES = 2
+# Rough continental US bounding box (lat_min, lat_max, lon_min, lon_max) --
+# does not cover Alaska, Hawaii, or the territories, all of which also have
+# 3DEP coverage; deliberately conservative rather than wrong.
+_CONTINENTAL_US_BOUNDS = (24.5, 49.5, -125.0, -66.9)
 
 # Every entry is a live, keyless Open-Meteo endpoint. "elevation" hits the
 # dedicated elevation API; everything else hits the forecast API's
@@ -177,6 +200,7 @@ class RealWorldDataset:
         self, name: str, bounds: tuple[float, float, float, float], scalar_fields: dict[str, ScalarField],
         layer_descriptions: dict[str, str] | None = None,
         layer_sources: dict[str, str | None] | None = None,
+        elevation_source: str = "open_meteo",
     ):
         # bounds = (lat_min, lat_max, lon_min, lon_max)
         self.name = name
@@ -191,6 +215,9 @@ class RealWorldDataset:
         # a path = user-uploaded) -- kept around so a caller that reuses a
         # cached dataset can still correctly report where the data came from.
         self.layer_sources = layer_sources or {}
+        # which live source an online-fetched "elevation" layer actually
+        # came from ("open_meteo" or "usgs") -- same reason as above.
+        self.elevation_source = elevation_source
 
 
 def _grid(bounds: tuple[float, float, float, float], resolution: int) -> tuple[np.ndarray, np.ndarray]:
@@ -351,6 +378,81 @@ def fetch_open_meteo_field(
     return ScalarField(name=variable, xs=xs, ys=ys, values=values)
 
 
+def is_in_continental_us(bounds: tuple[float, float, float, float]) -> bool:
+    """Whether the center of `bounds` falls within the (conservative,
+    continental-only) US bounding box USGS 3DEP coverage is assumed
+    available in."""
+    lat_min, lat_max, lon_min, lon_max = bounds
+    us_lat_min, us_lat_max, us_lon_min, us_lon_max = _CONTINENTAL_US_BOUNDS
+    mid_lat, mid_lon = (lat_min + lat_max) / 2, (lon_min + lon_max) / 2
+    return us_lat_min <= mid_lat <= us_lat_max and us_lon_min <= mid_lon <= us_lon_max
+
+
+def should_prefer_usgs_elevation(bounds: tuple[float, float, float, float], wants_high_resolution: bool) -> bool:
+    """The actual source-selection rule: USGS's genuinely higher-precision
+    (often ~1m) LiDAR-derived elevation is only worth its much higher
+    per-point cost when the query explicitly wants high-resolution terrain
+    data AND the area is somewhere 3DEP actually covers -- otherwise
+    Open-Meteo (fast, global, batched) is the better default."""
+    return bool(wants_high_resolution) and is_in_continental_us(bounds)
+
+
+def fetch_usgs_elevation_field(
+    bounds: tuple[float, float, float, float], resolution: int = GRID_RESOLUTION,
+) -> ScalarField:
+    """Live-fetches real elevation from USGS's 3DEP Elevation Point Query
+    Service (EPQS) -- genuinely LiDAR-derived data (the service reports the
+    native resolution of the raster each point came from; often 1m in
+    LiDAR-covered parts of the continental US), unlike Open-Meteo's fixed
+    ~90m SRTM data. Unlike Open-Meteo there is no batch endpoint: every
+    point is its own HTTP request, issued concurrently
+    (_USGS_CONCURRENCY workers) with retries; a request that still fails
+    after retries is filled from its nearest successfully-fetched
+    neighbor rather than left as a gap, since observed error rates under
+    concurrent load are non-trivial (~10%) but the analysis grid needs a
+    complete array. Always a fresh request at call time."""
+    xs, ys = _grid(bounds, resolution)
+    xx, yy = np.meshgrid(xs, ys)
+    lons = xx.ravel()
+    lats = yy.ravel()
+    values = np.full(lons.shape[0], np.nan)
+
+    def fetch_one(i: int):
+        query = urllib.parse.urlencode({
+            "x": f"{lons[i]:.6f}", "y": f"{lats[i]:.6f}", "units": "Meters", "wkid": 4326, "includeDate": "false",
+        })
+        url = f"https://epqs.nationalmap.gov/v1/json?{query}"
+        for attempt in range(_USGS_MAX_RETRIES + 1):
+            try:
+                with urllib.request.urlopen(url, timeout=15) as resp:
+                    payload = json.loads(resp.read())
+                return i, float(payload["value"])
+            except Exception:
+                if attempt == _USGS_MAX_RETRIES:
+                    return i, None
+        return i, None
+
+    with ThreadPoolExecutor(max_workers=_USGS_CONCURRENCY) as executor:
+        for i, value in executor.map(fetch_one, range(lons.shape[0])):
+            if value is not None:
+                values[i] = value
+
+    missing = np.isnan(values)
+    if missing.all():
+        raise RuntimeError(
+            "USGS elevation service returned no valid data for this area "
+            "(it may be outside 3DEP coverage) -- try Open-Meteo instead."
+        )
+    if missing.any():
+        valid_idx = np.where(~missing)[0]
+        valid_points = np.column_stack([lons[valid_idx], lats[valid_idx]])
+        for mi in np.where(missing)[0]:
+            dist2 = (valid_points[:, 0] - lons[mi]) ** 2 + (valid_points[:, 1] - lats[mi]) ** 2
+            values[mi] = values[valid_idx[np.argmin(dist2)]]
+
+    return ScalarField(name="elevation", xs=xs, ys=ys, values=values.reshape(xx.shape))
+
+
 def fetch_elevation_field(
     bounds: tuple[float, float, float, float], resolution: int = GRID_RESOLUTION,
 ) -> ScalarField:
@@ -375,6 +477,7 @@ def build_real_world_dataset(
     resolution: int = GRID_RESOLUTION,
     include_slope: bool = True,
     layer_descriptions: dict[str, str] | None = None,
+    elevation_source: str = "open_meteo",
 ) -> RealWorldDataset:
     """Builds a RealWorldDataset with one or more named layers.
 
@@ -387,6 +490,12 @@ def build_real_world_dataset(
     explanation of what it measures, carried through on the returned
     dataset for the caller to pass to an LLM recommendation step (custom
     uploaded layers have no built-in meaning the way "elevation" does).
+
+    elevation_source picks which live source an online-fetched "elevation"
+    layer comes from: "open_meteo" (fast, global, ~90m, the default) or
+    "usgs" (see fetch_usgs_elevation_field -- higher precision, US-only,
+    much slower; the caller decides when this is worth it via
+    should_prefer_usgs_elevation).
     """
     layer_sources = layer_sources or {"elevation": None}
     fields: dict[str, ScalarField] = {}
@@ -394,6 +503,8 @@ def build_real_world_dataset(
     for layer_name, source in layer_sources.items():
         if source is not None:
             fields[layer_name] = scalar_field_from_upload(layer_name, source, bounds, resolution)
+        elif layer_name == "elevation" and elevation_source == "usgs":
+            fields[layer_name] = fetch_usgs_elevation_field(bounds, resolution)
         elif layer_name in OPEN_METEO_VARIABLES:
             fields[layer_name] = fetch_open_meteo_field(layer_name, bounds, resolution)
         else:
@@ -407,5 +518,5 @@ def build_real_world_dataset(
 
     return RealWorldDataset(
         name=name, bounds=bounds, scalar_fields=fields, layer_descriptions=layer_descriptions,
-        layer_sources=layer_sources,
+        layer_sources=layer_sources, elevation_source=elevation_source,
     )

@@ -86,10 +86,11 @@
         <option value="relative_humidity_2m">relative_humidity_2m</option>
         <option value="surface_pressure">surface_pressure</option>
       </select>
-      <p class="hint">Fetched live from Open-Meteo (elevation is SRTM-derived at ~90m, not true
-        1m LiDAR; a "slope" layer is derived from it automatically). To supply your own data for
-        this topic instead, add a custom layer below named exactly the same as the topic
-        (e.g. "elevation").</p>
+      <p class="hint">Fetched live -- for elevation, "Parse query" above automatically picks
+        Open-Meteo (fast, global, ~90m) or USGS 3DEP (genuinely ~1m LiDAR-derived, US-only, slower)
+        based on what the query actually asks for; manual entry here always uses Open-Meteo. A
+        "slope" layer is derived from elevation automatically. To supply your own data for this
+        topic instead, add a custom layer below named exactly the same as the topic (e.g. "elevation").</p>
 
       <label for="rw-resolution">Grid resolution</label>
       <input id="rw-resolution" type="number" value="20" min="6" max="80">
