@@ -204,6 +204,7 @@ let realworldLayerControl;
 const realworldOverlays = {};
 let sqPreviewRect = null; // outline of the bounding box shown right after parsing, before raw data loads
 let rwDatasetId = null; // server-cached raw dataset from the last load; reused by Analyze so data isn't fetched twice
+let rwElevationSource = "open_meteo"; // set automatically by Parse's source-selection analysis; "usgs" for high-res US requests
 
 function initRealworldMap() {
   realworldMap = L.map("realworld-map");
@@ -256,6 +257,7 @@ function buildRealworldFormData() {
   formData.append("resolution", document.getElementById("rw-resolution").value);
   formData.append("primary_variable", document.getElementById("rw-variable").value);
   formData.append("use_sample_layer", document.getElementById("rw-sample").checked ? "true" : "false");
+  formData.append("elevation_source", rwElevationSource);
 
   document.querySelectorAll(".custom-layer-row").forEach((row) => {
     const name = row.querySelector(".rw-layer-name").value.trim();
@@ -277,7 +279,9 @@ function buildRealworldFormData() {
 // later Analyze call can reuse it instead of fetching all over again.
 async function loadRawDataPreview() {
   const formData = buildRealworldFormData();
-  setStatus("rw-status", "Loading raw data for the confirmed location...");
+  setStatus("rw-status", rwElevationSource === "usgs"
+    ? "Loading raw data from USGS 3DEP (one request per point -- this can take up to a minute or two)..."
+    : "Loading raw data for the confirmed location...");
   try {
     const res = await fetch("/api/realworld/load_data", { method: "POST", body: formData });
     const data = await res.json();
@@ -305,15 +309,22 @@ async function loadRawDataPreview() {
 
 // Any manual edit invalidates the cached raw dataset -- it no longer
 // matches what's in the fields, so Analyze must fetch fresh instead of
-// reusing stale data. Only fires on genuine user edits: Smart Query sets
-// these fields' .value programmatically, which does not dispatch input
-// events, so the auto-load in renderSmartQueryClarify is unaffected.
+// reusing stale data. It also resets the elevation source back to the
+// default: source selection came from analyzing the query's own wording,
+// which no longer applies once the user is editing fields by hand. Only
+// fires on genuine user edits: Smart Query sets these fields' .value
+// programmatically, which does not dispatch input events, so the
+// auto-load in renderSmartQueryClarify is unaffected.
+function invalidateRwDataset() {
+  rwDatasetId = null;
+  rwElevationSource = "open_meteo";
+}
 ["rw-bounds", "rw-variable", "rw-resolution"].forEach((id) => {
-  document.getElementById(id).addEventListener("input", () => { rwDatasetId = null; });
-  document.getElementById(id).addEventListener("change", () => { rwDatasetId = null; });
+  document.getElementById(id).addEventListener("input", invalidateRwDataset);
+  document.getElementById(id).addEventListener("change", invalidateRwDataset);
 });
-document.getElementById("rw-add-layer").addEventListener("click", () => { rwDatasetId = null; });
-document.getElementById("rw-sample").addEventListener("change", () => { rwDatasetId = null; });
+document.getElementById("rw-add-layer").addEventListener("click", invalidateRwDataset);
+document.getElementById("rw-sample").addEventListener("change", invalidateRwDataset);
 
 async function submitRealworldAnalyze(feedback) {
   const formData = buildRealworldFormData();
@@ -466,24 +477,35 @@ function renderSmartQueryClarify(data) {
   document.getElementById("rw-bounds").value =
     [latMin, latMax, lonMin, lonMax].map((v) => v.toFixed(5)).join(",");
   document.getElementById("rw-variable").value = data.variable;
+  rwElevationSource = data.elevation_source || "open_meteo";
 
+  // data.resolution can be set either because the query named a target
+  // meters spacing, or because source selection (e.g. USGS) forces a cap
+  // with no meters target given -- these need different wording.
   let resolutionLine = "";
   if (data.resolution) {
     document.getElementById("rw-resolution").value = data.resolution;
-    const requested = data.requested_resolution_meters;
     const achieved = data.achieved_resolution_meters;
-    const closeEnough = achieved <= requested * 1.1; // within ~10% counts as "hit the target"
-    resolutionLine = closeEnough
-      ? `<br><b>Grid resolution:</b> set to ${data.resolution} (~${Math.round(achieved)}m between samples, close to the requested ${requested}m).`
-      : `<br><b>Grid resolution:</b> capped at ${data.resolution} (the max supported) -- this bounding box is too large to ` +
-        `actually reach ${requested}m; the closest achievable is ~${Math.round(achieved)}m. Shrink the bounding box for finer resolution.`;
+    if (data.requested_resolution_meters) {
+      const requested = data.requested_resolution_meters;
+      const closeEnough = achieved <= requested * 1.1; // within ~10% counts as "hit the target"
+      resolutionLine = closeEnough
+        ? `<br><b>Grid resolution:</b> set to ${data.resolution} (~${Math.round(achieved)}m between samples, close to the requested ${requested}m).`
+        : `<br><b>Grid resolution:</b> capped at ${data.resolution} (the max supported) -- this bounding box is too large to ` +
+          `actually reach ${requested}m; the closest achievable is ~${Math.round(achieved)}m. Shrink the bounding box for finer resolution.`;
+    } else if (achieved) {
+      resolutionLine = `<br><b>Grid resolution:</b> set to ${data.resolution} (~${Math.round(achieved)}m between samples).`;
+    }
   }
+
+  const sourceLine = data.source_note ? `<br><b>Data source:</b> ${data.source_note}` : "";
 
   document.getElementById("sq-clarify-summary").innerHTML =
     `<b>Bounding box:</b> ${latMin.toFixed(3)}, ${latMax.toFixed(3)}, ${lonMin.toFixed(3)}, ${lonMax.toFixed(3)}` +
     placeLine +
     `<br><b>Topic:</b> ${data.variable}` +
     resolutionLine +
+    sourceLine +
     `<br>Loading the raw data now -- once it's on the map, click "Fetch &amp; Analyze" to find critical points.`;
   document.getElementById("sq-clarify").hidden = false;
   updateGroundResolutionHint();
