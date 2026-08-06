@@ -484,11 +484,18 @@ def build_real_world_dataset(
 
     elevation_source picks which live source an online-fetched "elevation"
     layer comes from:
-    - "auto" (the default): try USGS 3DEP first (see
-      fetch_usgs_elevation_field -- genuinely higher precision, often ~1m,
-      but US-only and much slower, one HTTP request per point), falling
-      back to Open-Meteo (fast, global, ~90m) if USGS fails or the
-      location has no 3DEP coverage.
+    - "auto" (the default): prefer USGS 3DEP (see fetch_usgs_elevation_field
+      -- genuinely higher precision, often ~1m, but US-only and much
+      slower, one HTTP request per point) ONLY when it can actually
+      deliver the requested resolution -- its practical point-count cap
+      (MAX_USGS_GRID_RESOLUTION) is far tighter than Open-Meteo's, so
+      silently capping a fine request down to fit USGS would mean e.g. a
+      "100m pixels" request quietly comes back much coarser instead. A
+      request that needs a finer grid than USGS can serve goes straight to
+      Open-Meteo (fast, global, ~90m, much higher point-count ceiling),
+      which can actually get close to what was asked. Either way, if the
+      chosen primary source fails outright (rate limit, outage, no 3DEP
+      coverage), the other is tried as a fallback before giving up.
     - "usgs": USGS only, no fallback -- fails outright if USGS does.
     - "open_meteo": Open-Meteo only, no fallback -- for when the higher
       precision isn't worth the wait.
@@ -502,26 +509,38 @@ def build_real_world_dataset(
     for layer_name, source in layer_sources.items():
         if source is not None:
             fields[layer_name] = scalar_field_from_upload(layer_name, source, bounds, resolution)
-        elif layer_name == "elevation" and elevation_source == "usgs":
-            fields[layer_name] = fetch_usgs_elevation_field(bounds, resolution)
-        elif layer_name == "elevation" and elevation_source == "open_meteo":
-            fields[layer_name] = fetch_open_meteo_field("elevation", bounds, resolution)
         elif layer_name == "elevation":
-            # "auto" (default): USGS first, Open-Meteo as the fallback.
-            usgs_resolution = min(resolution, MAX_USGS_GRID_RESOLUTION)
-            if is_in_continental_us(bounds):
-                try:
-                    fields[layer_name] = fetch_usgs_elevation_field(bounds, usgs_resolution)
-                    actual_elevation_source = "usgs"
-                except Exception as primary_exc:
-                    try:
-                        fields[layer_name] = fetch_open_meteo_field("elevation", bounds, resolution)
-                    except Exception:
-                        raise primary_exc from None  # neither source worked; the USGS error is more informative
-                    actual_elevation_source = "open_meteo"
+            usgs_capped_resolution = min(resolution, MAX_USGS_GRID_RESOLUTION)
+            usgs_ok = is_in_continental_us(bounds)
+            usgs_can_hit_target = usgs_ok and resolution <= MAX_USGS_GRID_RESOLUTION
+
+            if elevation_source == "usgs":
+                attempts = [("usgs", resolution)]
+            elif elevation_source == "open_meteo":
+                attempts = [("open_meteo", resolution)]
+                if usgs_ok:
+                    attempts.append(("usgs", usgs_capped_resolution))
+            elif usgs_can_hit_target:
+                attempts = [("usgs", resolution), ("open_meteo", resolution)]
+            elif usgs_ok:
+                attempts = [("open_meteo", resolution), ("usgs", usgs_capped_resolution)]
             else:
-                fields[layer_name] = fetch_open_meteo_field("elevation", bounds, resolution)
-                actual_elevation_source = "open_meteo"
+                attempts = [("open_meteo", resolution)]
+
+            first_error = None
+            for source_name, attempt_resolution in attempts:
+                try:
+                    fields[layer_name] = (
+                        fetch_usgs_elevation_field(bounds, attempt_resolution) if source_name == "usgs"
+                        else fetch_open_meteo_field("elevation", bounds, attempt_resolution)
+                    )
+                    actual_elevation_source = source_name
+                    break
+                except Exception as exc:
+                    if first_error is None:
+                        first_error = exc
+            else:
+                raise first_error
         elif layer_name in OPEN_METEO_VARIABLES:
             fields[layer_name] = fetch_open_meteo_field(layer_name, bounds, resolution)
         else:
