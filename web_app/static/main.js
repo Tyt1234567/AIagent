@@ -378,8 +378,11 @@ async function submitRealworldAnalyze(feedback) {
 
 // Mirrors resolution_for_target_spacing / ground_spacing_meters in
 // geoai_agent/real_data.py -- shows the grid point count and actually
-// achievable spacing a requested meters-based pixel size resolves to,
-// including when it gets capped, before the request is even sent.
+// achievable per-axis spacing a requested meters-based pixel size resolves
+// to, including when it gets capped, before the request is even sent. Each
+// axis (longitude/x, latitude/y) is sized independently from the box's own
+// physical length on that axis, so a non-square box gets a non-square
+// point count instead of both axes being forced to share one number.
 const RW_MIN_GRID_RESOLUTION = 6;
 const RW_MAX_GRID_RESOLUTION = 80;
 const RW_MAX_USGS_GRID_RESOLUTION = 10;
@@ -396,20 +399,25 @@ function updateGroundResolutionHint() {
   const midLatRad = ((latMin + latMax) / 2) * (Math.PI / 180);
   const metersPerDegLat = 111320;
   const metersPerDegLon = 111320 * Math.cos(midLatRad);
-  const spanM = Math.max(Math.abs(latMax - latMin) * metersPerDegLat, Math.abs(lonMax - lonMin) * metersPerDegLon);
+  const lonSpanM = Math.abs(lonMax - lonMin) * metersPerDegLon;
+  const latSpanM = Math.abs(latMax - latMin) * metersPerDegLat;
 
-  let resolution = Math.ceil(spanM / meters) + 1;
-  const cappedByMax = resolution > RW_MAX_GRID_RESOLUTION;
-  resolution = Math.max(RW_MIN_GRID_RESOLUTION, Math.min(resolution, RW_MAX_GRID_RESOLUTION));
-  const achieved = spanM / (resolution - 1);
+  const axisPoints = (spanM) => Math.max(
+    RW_MIN_GRID_RESOLUTION, Math.min(Math.ceil(spanM / meters) + 1, RW_MAX_GRID_RESOLUTION)
+  );
+  const nx = axisPoints(lonSpanM);
+  const ny = axisPoints(latSpanM);
+  const cappedByMax = nx === RW_MAX_GRID_RESOLUTION || ny === RW_MAX_GRID_RESOLUTION;
+  const achievedLon = lonSpanM / (nx - 1);
+  const achievedLat = latSpanM / (ny - 1);
 
   let note = "";
-  if (cappedByMax) note = ` (capped at ${RW_MAX_GRID_RESOLUTION}x${RW_MAX_GRID_RESOLUTION} for practicality)`;
-  else if (resolution > RW_MAX_USGS_GRID_RESOLUTION) {
+  if (cappedByMax) note = " (capped for practicality)";
+  else if (nx > RW_MAX_USGS_GRID_RESOLUTION || ny > RW_MAX_USGS_GRID_RESOLUTION) {
     note = ` -- if USGS is used for elevation, it caps lower (${RW_MAX_USGS_GRID_RESOLUTION}x${RW_MAX_USGS_GRID_RESOLUTION})`;
   }
-  el.textContent = `~${resolution}x${resolution} grid (${resolution * resolution} points, ` +
-    `~${Math.round(achieved)}m between samples)${note}`;
+  el.textContent = `~${nx}x${ny} grid (${nx * ny} points, ` +
+    `~${Math.round(achievedLon)}m x ~${Math.round(achievedLat)}m between samples)${note}`;
 }
 document.getElementById("rw-bounds").addEventListener("input", updateGroundResolutionHint);
 document.getElementById("rw-resolution-meters").addEventListener("input", updateGroundResolutionHint);
@@ -524,13 +532,17 @@ function renderSmartQueryClarify(data) {
   let resolutionLine = "";
   if (data.requested_resolution_meters) {
     const requested = data.requested_resolution_meters;
-    const achieved = data.achieved_resolution_meters;
+    const [achievedLon, achievedLat] = data.achieved_resolution_meters;
+    const achievedWorst = Math.max(achievedLon, achievedLat); // the coarser of the two axes
     document.getElementById("rw-resolution-meters").value = requested;
-    const closeEnough = achieved <= requested * 1.1; // within ~10% counts as "hit the target"
+    const closeEnough = achievedWorst <= requested * 1.1; // within ~10% counts as "hit the target"
+    const achievedText = Math.round(achievedLon) === Math.round(achievedLat)
+      ? `~${Math.round(achievedWorst)}m`
+      : `~${Math.round(achievedLon)}m x ~${Math.round(achievedLat)}m`;
     resolutionLine = closeEnough
-      ? `<br><b>Resolution:</b> ~${Math.round(achieved)}m between samples, close to the requested ${requested}m.`
+      ? `<br><b>Resolution:</b> ${achievedText} between samples, close to the requested ${requested}m.`
       : `<br><b>Resolution:</b> this bounding box is too large to actually reach ${requested}m at a ` +
-        `practical grid size; the closest achievable is ~${Math.round(achieved)}m. Shrink the bounding ` +
+        `practical grid size; the closest achievable is ${achievedText}. Shrink the bounding ` +
         "box for finer resolution.";
   }
 
