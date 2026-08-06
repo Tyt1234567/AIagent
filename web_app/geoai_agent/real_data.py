@@ -54,9 +54,9 @@ GRID_RESOLUTION = 20
 MIN_GRID_RESOLUTION = 6
 # The Morse engine itself handles a 100x100 grid in well under a second;
 # the real cost is live HTTP fetch batches (100 coordinates/request), which
-# scale with resolution^2. 80 keeps a worst-case request in the
-# tens-of-seconds range rather than minutes, and well clear of Open-Meteo's
-# per-minute rate limit.
+# scale with the total point count. 80 keeps a worst-case single-axis
+# request in the tens-of-seconds range rather than minutes, and well clear
+# of Open-Meteo's per-minute rate limit.
 MAX_GRID_RESOLUTION = 80
 _FETCH_BATCH = 100  # conservative shared batch size, verified against the elevation endpoint's limit
 _METERS_PER_DEGREE_LAT = 111_320
@@ -158,37 +158,67 @@ def bounding_box_around_point(
             longitude - half_width_deg, longitude + half_width_deg)
 
 
-def ground_spacing_meters(bounds: tuple[float, float, float, float], resolution: int) -> float:
-    """The actual meters-between-sample-points a grid resolution achieves
-    over a bounding box (the larger of the lat/lon spacings, since that's
-    the coarser -- worse-case -- direction)."""
+def _as_axis_counts(resolution: int | tuple[int, int]) -> tuple[int, int]:
+    """Normalizes a resolution to (nx, ny) -- points along longitude and
+    latitude respectively. A plain int (from older/simpler callers, e.g.
+    real_world_example.py) means a square nx == ny grid, same as before;
+    a (nx, ny) tuple lets each axis have its own point count, so a
+    non-square bounding box can get pixels that are genuinely square on
+    the ground instead of both axes being forced to share one count."""
+    if isinstance(resolution, tuple):
+        return resolution
+    return resolution, resolution
+
+
+def ground_spacing_meters(
+    bounds: tuple[float, float, float, float], resolution: int | tuple[int, int],
+) -> tuple[float, float]:
+    """The actual (lon_spacing, lat_spacing) meters-between-sample-points a
+    grid resolution achieves over a bounding box -- one value per axis,
+    since nx and ny are no longer forced to match each other, so a single
+    shared number would hide a mismatch between the two."""
+    nx, ny = _as_axis_counts(resolution)
     lat_min, lat_max, lon_min, lon_max = bounds
     mid_lat_rad = math.radians((lat_min + lat_max) / 2)
     meters_per_deg_lon = _METERS_PER_DEGREE_LAT * math.cos(mid_lat_rad)
-    lat_spacing = abs(lat_max - lat_min) / (resolution - 1) * _METERS_PER_DEGREE_LAT
-    lon_spacing = abs(lon_max - lon_min) / (resolution - 1) * meters_per_deg_lon
-    return max(lat_spacing, lon_spacing)
+    lon_spacing = abs(lon_max - lon_min) / (nx - 1) * meters_per_deg_lon
+    lat_spacing = abs(lat_max - lat_min) / (ny - 1) * _METERS_PER_DEGREE_LAT
+    return lon_spacing, lat_spacing
 
 
-def resolution_for_target_spacing(bounds: tuple[float, float, float, float], target_meters: float) -> int:
-    """Grid resolution (points per axis) needed so ground_spacing_meters is
-    approximately target_meters over the given box, clamped to
-    [MIN_GRID_RESOLUTION, MAX_GRID_RESOLUTION]. A large box + a fine target
-    (e.g. "30 meters" over a 13km box) can need a resolution far beyond the
-    cap -- the caller should compare the requested target against
-    ground_spacing_meters(bounds, result) to see if it was actually
-    achievable, and tell the user if not, rather than silently returning
-    a coarser grid than they asked for."""
+def resolution_for_target_spacing(
+    bounds: tuple[float, float, float, float], target_meters: float,
+) -> tuple[int, int]:
+    """Grid resolution (nx, ny) -- points along longitude and latitude
+    respectively -- needed so ground_spacing_meters is approximately
+    target_meters on EACH axis independently: pixel count follows the
+    box's own shape (nx ~= lon_span_m / target_meters, ny ~= lat_span_m /
+    target_meters), so a pixel is genuinely ~target_meters x
+    target_meters on the ground instead of a single shared point count
+    distorting non-square boxes into non-square pixels.
+
+    Each axis is floored at MIN_GRID_RESOLUTION and ceiled at
+    MAX_GRID_RESOLUTION independently -- a large box + a fine target (e.g.
+    "30 meters" over a 13km box) can need more points than the cap allows
+    on one or both axes; the caller should compare the requested target
+    against ground_spacing_meters(bounds, result) to see if it was
+    actually achievable, and tell the user if not, rather than silently
+    returning a coarser grid than they asked for. Since both axes share
+    the same per-axis cap, the total point count (nx * ny) is always
+    bounded by MAX_GRID_RESOLUTION ** 2, the same worst-case budget the
+    old square-only grid had."""
     if target_meters <= 0:
-        return GRID_RESOLUTION
+        return GRID_RESOLUTION, GRID_RESOLUTION
     lat_min, lat_max, lon_min, lon_max = bounds
     mid_lat_rad = math.radians((lat_min + lat_max) / 2)
     meters_per_deg_lon = _METERS_PER_DEGREE_LAT * math.cos(mid_lat_rad)
     lat_span_m = abs(lat_max - lat_min) * _METERS_PER_DEGREE_LAT
     lon_span_m = abs(lon_max - lon_min) * meters_per_deg_lon
-    span_m = max(lat_span_m, lon_span_m)
-    resolution = math.ceil(span_m / target_meters) + 1
-    return max(MIN_GRID_RESOLUTION, min(resolution, MAX_GRID_RESOLUTION))
+
+    def axis_points(span_m: float) -> int:
+        return max(MIN_GRID_RESOLUTION, min(math.ceil(span_m / target_meters) + 1, MAX_GRID_RESOLUTION))
+
+    return axis_points(lon_span_m), axis_points(lat_span_m)
 
 
 class RealWorldDataset:
@@ -220,10 +250,11 @@ class RealWorldDataset:
         self.elevation_source = elevation_source
 
 
-def _grid(bounds: tuple[float, float, float, float], resolution: int) -> tuple[np.ndarray, np.ndarray]:
+def _grid(bounds: tuple[float, float, float, float], resolution: int | tuple[int, int]) -> tuple[np.ndarray, np.ndarray]:
     lat_min, lat_max, lon_min, lon_max = bounds
-    xs = np.linspace(lon_min, lon_max, resolution)  # x = longitude
-    ys = np.linspace(lat_min, lat_max, resolution)  # y = latitude
+    nx, ny = _as_axis_counts(resolution)
+    xs = np.linspace(lon_min, lon_max, nx)  # x = longitude
+    ys = np.linspace(lat_min, lat_max, ny)  # y = latitude
     return xs, ys
 
 
@@ -309,7 +340,7 @@ def load_layer_points(path: str) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
 
 def scalar_field_from_upload(
     name: str, path: str, bounds: tuple[float, float, float, float],
-    resolution: int = GRID_RESOLUTION, power: float = 2.0,
+    resolution: int | tuple[int, int] = GRID_RESOLUTION, power: float = 2.0,
 ) -> ScalarField:
     """Builds a ScalarField for `name` by IDW-interpolating user-supplied
     scattered samples (CSV or shapefile, see load_layer_points) onto the
@@ -326,7 +357,7 @@ scalar_field_from_csv = scalar_field_from_upload
 
 
 def fetch_open_meteo_field(
-    variable: str, bounds: tuple[float, float, float, float], resolution: int = GRID_RESOLUTION,
+    variable: str, bounds: tuple[float, float, float, float], resolution: int | tuple[int, int] = GRID_RESOLUTION,
 ) -> ScalarField:
     """Live-fetches `variable` (a key in OPEN_METEO_VARIABLES) for every
     grid node over `bounds` from Open-Meteo, batched at a conservative
@@ -389,7 +420,7 @@ def is_in_continental_us(bounds: tuple[float, float, float, float]) -> bool:
 
 
 def fetch_usgs_elevation_field(
-    bounds: tuple[float, float, float, float], resolution: int = GRID_RESOLUTION,
+    bounds: tuple[float, float, float, float], resolution: int | tuple[int, int] = GRID_RESOLUTION,
 ) -> ScalarField:
     """Live-fetches real elevation from USGS's 3DEP Elevation Point Query
     Service (EPQS) -- genuinely LiDAR-derived data (the service reports the
@@ -445,7 +476,7 @@ def fetch_usgs_elevation_field(
 
 
 def fetch_elevation_field(
-    bounds: tuple[float, float, float, float], resolution: int = GRID_RESOLUTION,
+    bounds: tuple[float, float, float, float], resolution: int | tuple[int, int] = GRID_RESOLUTION,
 ) -> ScalarField:
     """Fetches real terrain elevation -- thin wrapper over
     fetch_open_meteo_field kept for existing callers (real_world_example.py)."""
@@ -465,7 +496,7 @@ def build_real_world_dataset(
     name: str,
     bounds: tuple[float, float, float, float],
     layer_sources: dict[str, str | None] | None = None,
-    resolution: int = GRID_RESOLUTION,
+    resolution: int | tuple[int, int] = GRID_RESOLUTION,
     include_slope: bool = True,
     layer_descriptions: dict[str, str] | None = None,
     elevation_source: str = "auto",
@@ -510,9 +541,10 @@ def build_real_world_dataset(
         if source is not None:
             fields[layer_name] = scalar_field_from_upload(layer_name, source, bounds, resolution)
         elif layer_name == "elevation":
-            usgs_capped_resolution = min(resolution, MAX_USGS_GRID_RESOLUTION)
+            nx, ny = _as_axis_counts(resolution)
+            usgs_capped_resolution = (min(nx, MAX_USGS_GRID_RESOLUTION), min(ny, MAX_USGS_GRID_RESOLUTION))
             usgs_ok = is_in_continental_us(bounds)
-            usgs_can_hit_target = usgs_ok and resolution <= MAX_USGS_GRID_RESOLUTION
+            usgs_can_hit_target = usgs_ok and nx <= MAX_USGS_GRID_RESOLUTION and ny <= MAX_USGS_GRID_RESOLUTION
 
             if elevation_source == "usgs":
                 attempts = [("usgs", resolution)]

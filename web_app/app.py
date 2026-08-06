@@ -252,7 +252,8 @@ def _parse_realworld_form():
     if elevation_source not in ("auto", "open_meteo", "usgs"):
         elevation_source = "auto"
     if elevation_source == "usgs":
-        resolution = min(resolution, MAX_USGS_GRID_RESOLUTION)
+        nx, ny = resolution
+        resolution = (min(nx, MAX_USGS_GRID_RESOLUTION), min(ny, MAX_USGS_GRID_RESOLUTION))
 
     layer_sources: dict[str, str | None] = {primary_variable: None}
     layer_descriptions: dict[str, str] = {}
@@ -448,13 +449,13 @@ def realworld_smart_query():
         resolved_place = geocoded
 
     resolution = None
-    achieved_meters = None
+    achieved_meters = None  # (lon_spacing_m, lat_spacing_m) -- the two axes are no longer forced equal
     requested_meters = extraction.get("target_resolution_meters")
     if requested_meters:
         try:
             requested_meters = float(requested_meters)
             resolution = resolution_for_target_spacing(bounds, requested_meters)
-            achieved_meters = ground_spacing_meters(bounds, resolution)
+            achieved_meters = list(ground_spacing_meters(bounds, resolution))
         except (TypeError, ValueError):
             requested_meters = None
 
