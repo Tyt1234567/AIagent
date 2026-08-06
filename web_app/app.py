@@ -230,12 +230,13 @@ def _parse_realworld_form():
 
     # Resolution is specified as a physical ground distance (pixel size, in
     # meters) rather than a raw grid point count -- resolution_for_target_
-    # spacing converts it to the point count needed to hit that spacing
-    # over this bounding box, already clamped to [MIN_GRID_RESOLUTION,
-    # MAX_GRID_RESOLUTION]. 500m is a reasonable default for a typical
-    # town-scale box.
+    # spacing converts it to the (nx, ny) point count needed to hit that
+    # spacing over this bounding box, each axis independently clamped to
+    # [MIN_GRID_RESOLUTION, MAX_GRID_RESOLUTION]. 80m matches the frontend's
+    # default and is a reasonable default pixel size for a typical
+    # neighborhood-scale box.
     try:
-        resolution_meters = float(request.form.get("resolution_meters", 500))
+        resolution_meters = float(request.form.get("resolution_meters", 80))
     except ValueError:
         return {"error": "resolution_meters must be a number"}, 400
     if resolution_meters <= 0:
@@ -382,10 +383,16 @@ def realworld_analyze():
     layers = {}
     for name, field in dataset.scalar_fields.items():
         result = results[name]
+        summary = _layer_summary(result)
+        # the grid actually achieved -- may be coarser than what was
+        # requested if a source (e.g. USGS after an Open-Meteo fallback)
+        # couldn't deliver the full resolution, so the frontend can show
+        # this rather than silently rendering a coarser result unexplained.
+        summary["shape"] = list(field.shape)
         layers[name] = {
             "field": field_to_geojson(field),
             "points": critical_points_to_geojson(result),
-            "summary": _layer_summary(result),
+            "summary": summary,
         }
 
     lat_min, lat_max, lon_min, lon_max = bounds

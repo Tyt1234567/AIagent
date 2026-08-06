@@ -433,6 +433,13 @@ function renderRealworldResult(data) {
   const summaryContainer = document.getElementById("rw-layer-summaries");
   summaryContainer.innerHTML = "";
 
+  if (data.elevation_source) {
+    const sourceNote = document.createElement("p");
+    sourceNote.className = "hint";
+    sourceNote.textContent = `Elevation data source actually used: ${data.elevation_source}`;
+    summaryContainer.appendChild(sourceNote);
+  }
+
   let first = true;
   for (const [name, layer] of Object.entries(data.layers)) {
     const field = fieldLayer(layer.field);
@@ -447,9 +454,11 @@ function renderRealworldResult(data) {
 
     const s = layer.summary;
     const euler = s.euler_characteristic;
+    const [ny, nx] = s.shape;
     const div = document.createElement("div");
     div.className = "layer-summary";
-    div.innerHTML = `<b>${name}</b><br>range: [${s.value_range[0].toFixed(2)}, ${s.value_range[1].toFixed(2)}]
+    div.innerHTML = `<b>${name}</b> (${nx}x${ny} grid, ${nx * ny} points)<br>
+      range: [${s.value_range[0].toFixed(2)}, ${s.value_range[1].toFixed(2)}]
       &nbsp;|&nbsp; significant pit basins: ${s.num_significant_basins}
       &nbsp;|&nbsp; significant peak basins: ${s.num_significant_peak_basins}
       &nbsp;|&nbsp; threshold: ${s.persistence_threshold.toFixed(3)}

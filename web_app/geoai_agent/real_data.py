@@ -41,6 +41,7 @@ import csv
 import json
 import math
 import re
+import time
 import urllib.error
 import urllib.request
 import urllib.parse
@@ -59,6 +60,20 @@ MIN_GRID_RESOLUTION = 6
 # of Open-Meteo's per-minute rate limit.
 MAX_GRID_RESOLUTION = 80
 _FETCH_BATCH = 100  # conservative shared batch size, verified against the elevation endpoint's limit
+# Open-Meteo's free tier enforces a per-minute request cap that a large
+# grid (many batches issued back-to-back) can exhaust well before the
+# fetch is done -- observed live, failing as early as batch 7 of 64 for an
+# 80x80 grid. That 429 specifically says "try again in one minute", so it
+# is worth waiting out and retrying rather than immediately giving up and
+# falling back to a much coarser source (USGS's point-count cap is far
+# tighter) -- a fine-resolution request should actually be delivered at
+# the requested resolution, just slower, not silently degraded.
+_OPEN_METEO_MINUTELY_RETRY_WAIT_SECONDS = 65
+_OPEN_METEO_MINUTELY_MAX_RETRIES = 2
+# Proactive spacing between batches, so a large grid never bursts past the
+# per-minute cap in the first place -- the reactive retry above is only a
+# safety net for whatever residual burst still slips through.
+_OPEN_METEO_BATCH_PACING_SECONDS = 1.0
 _METERS_PER_DEGREE_LAT = 111_320
 
 # USGS EPQS is queried one point at a time (no batch endpoint). Measured
@@ -374,6 +389,14 @@ def fetch_open_meteo_field(
 
     num_batches = -(-lons.shape[0] // _FETCH_BATCH)  # ceil division
     for batch_idx, start in enumerate(range(0, lons.shape[0], _FETCH_BATCH)):
+        # Paced BEFORE every batch but the first -- observed live, issuing
+        # batches back-to-back with no delay tripped the per-minute limit
+        # as early as the 7th request. Retrying-after-429 alone isn't
+        # enough: once the wait is over, resuming a rapid-fire burst on the
+        # REMAINING batches immediately re-trips the same limit. Spreading
+        # requests out from the start avoids ever bursting past it.
+        if batch_idx > 0:
+            time.sleep(_OPEN_METEO_BATCH_PACING_SECONDS)
         end = start + _FETCH_BATCH
         lat_param = ",".join(f"{v:.6f}" for v in lats[start:end])
         lon_param = ",".join(f"{v:.6f}" for v in lons[start:end])
@@ -385,20 +408,28 @@ def fetch_open_meteo_field(
                 "https://api.open-meteo.com/v1/forecast?"
                 f"{urllib.parse.urlencode({'latitude': lat_param, 'longitude': lon_param, 'current': variable})}"
             )
-        try:
-            with urllib.request.urlopen(url, timeout=30) as resp:
-                payload = json.loads(resp.read())
-        except urllib.error.HTTPError as exc:
-            reason = exc.read().decode("utf-8", errors="replace")
+        payload = None
+        for attempt in range(_OPEN_METEO_MINUTELY_MAX_RETRIES + 1):
             try:
-                reason = json.loads(reason).get("reason", reason)
-            except json.JSONDecodeError:
-                pass
-            raise RuntimeError(
-                f"Open-Meteo request failed on batch {batch_idx + 1}/{num_batches} "
-                f"({exc.code} {exc.reason}): {reason}. Try a lower resolution or a smaller "
-                "bounding box, or wait a moment before retrying."
-            ) from exc
+                with urllib.request.urlopen(url, timeout=30) as resp:
+                    payload = json.loads(resp.read())
+                break
+            except urllib.error.HTTPError as exc:
+                reason = exc.read().decode("utf-8", errors="replace")
+                try:
+                    reason = json.loads(reason).get("reason", reason)
+                except json.JSONDecodeError:
+                    pass
+                # only the per-minute limit is worth waiting out -- a daily
+                # limit or any other error won't be fixed by retrying now.
+                if exc.code == 429 and "minutely" in reason.lower() and attempt < _OPEN_METEO_MINUTELY_MAX_RETRIES:
+                    time.sleep(_OPEN_METEO_MINUTELY_RETRY_WAIT_SECONDS)
+                    continue
+                raise RuntimeError(
+                    f"Open-Meteo request failed on batch {batch_idx + 1}/{num_batches} "
+                    f"({exc.code} {exc.reason}): {reason}. Try a lower resolution or a smaller "
+                    "bounding box, or wait a moment before retrying."
+                ) from exc
 
         if variable == "elevation":
             out[start:end] = payload["elevation"]
